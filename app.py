@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import html as _html
 import io
+import json
 import random
 import re
 from datetime import date
@@ -932,6 +933,7 @@ hr {border-color: var(--border) !important;}
 .fh-rate-head span:last-child {color: var(--muted); font-variant-numeric: tabular-nums;}
 .fh-rate .fh-bar {height: 12px;}
 .fh-theme-marker {display: none;}
+.fh-theme-label {font-size: .75rem; color: var(--muted); text-align: right; margin-top: -.4rem;}
 .fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
 @media (max-width: 720px) {.block-container {padding: .8rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
@@ -957,10 +959,34 @@ def theme_css(dark: bool) -> str:
         f":root {{{_theme_vars(mode)}}}"
         f":root:not(:has(.fh-dark-marker)) {{{_theme_vars('light')}}}"
         f":root:has(.fh-dark-marker) {{{_theme_vars('dark')}}}"
+        f':root[data-fh-theme="light"] {{{_theme_vars("light")}}}'
+        f':root[data-fh-theme="dark"] {{{_theme_vars("dark")}}}'
         + BASE_CSS
     )
     css = re.sub(r"\s+", " ", css).strip()  # one line, no blank lines (Markdown-safe)
     return f"<style>{css}</style>"
+
+
+def theme_script_html(dark: bool) -> str:
+    """A <script> that injects the theme CSS straight into the parent page's <head>.
+
+    Used as a second, independent way to apply the theme in case the <style> block sent
+    through Markdown is stripped or ignored by the Streamlit version in use.
+    """
+    css = theme_css(dark)[len("<style>"):-len("</style>")]
+    payload = json.dumps(css).replace("</", "<\\/")
+    mode = "dark" if dark else "light"
+    return (
+        "<script>(function(){try{var d=window.parent.document;var id='fh-theme-style';"
+        "var el=d.getElementById(id);if(!el){el=d.createElement('style');el.id=id;d.head.appendChild(el);}"
+        f"el.textContent={payload};"
+        f"d.documentElement.setAttribute('data-fh-theme','{mode}');"
+        "}catch(e){}})();</script>"
+    )
+
+
+def theme_label_html(dark: bool) -> str:
+    return f'<div class="fh-theme-label">Theme: {"Dark" if dark else "Light"}</div>'
 
 
 def theme_marker_html(dark: bool) -> str:
@@ -1200,7 +1226,15 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     with top_right:
         st.toggle("🌙 Dark mode", key="dark_mode")
     dark = bool(state.get("dark_mode"))
+    with top_right:
+        st.markdown(theme_label_html(dark), unsafe_allow_html=True)
     st.markdown(theme_css(dark) + theme_marker_html(dark), unsafe_allow_html=True)
+    try:  # second, independent way to apply the theme (see theme_script_html)
+        import streamlit.components.v1 as components
+
+        components.html(theme_script_html(dark), height=0)
+    except Exception:  # noqa: BLE001 - purely a progressive enhancement
+        pass
     with top_left:
         st.markdown(hero_html(), unsafe_allow_html=True)
 
