@@ -14,16 +14,20 @@ Design notes
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import html as _html
 import io
 import json
+import math
 import random
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+
+import auth
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -37,6 +41,7 @@ SUPPORTED_EXTENSIONS = (".txt", ".pdf", ".docx")
 WEIGHT_SKILLS = 60.0
 WEIGHT_EXPERIENCE = 25.0
 WEIGHT_KEYWORDS = 15.0
+DEFAULT_WEIGHTS = (WEIGHT_SKILLS, WEIGHT_EXPERIENCE, WEIGHT_KEYWORDS)
 
 # canonical skill -> accepted spellings (all matched case-insensitively on word edges)
 SKILL_BANK: Dict[str, List[str]] = {
@@ -249,9 +254,9 @@ def _read_docx(data: bytes) -> str:
 _PATTERN_CACHE: Dict[str, "re.Pattern[str]"] = {}
 
 
-def _skill_aliases(skill: str) -> List[str]:
+def _skill_aliases(skill: str, bank: Optional[Dict[str, List[str]]] = None) -> List[str]:
     key = skill.strip().lower()
-    return SKILL_BANK.get(key, [key])
+    return (bank if bank is not None else SKILL_BANK).get(key, [key])
 
 
 def _alias_pattern(alias: str) -> "re.Pattern[str]":
@@ -264,20 +269,21 @@ def _alias_pattern(alias: str) -> "re.Pattern[str]":
     return pattern
 
 
-def has_skill(text: str, skill: str) -> bool:
+def has_skill(text: str, skill: str, skill_bank: Optional[Dict[str, List[str]]] = None) -> bool:
     if not text or not skill or not skill.strip():
         return False
-    return any(_alias_pattern(alias).search(text) for alias in _skill_aliases(skill))
+    return any(_alias_pattern(alias).search(text) for alias in _skill_aliases(skill, skill_bank))
 
 
-def canonical_skill(name: str) -> str:
+def canonical_skill(name: str, skill_bank: Optional[Dict[str, List[str]]] = None) -> str:
     """Map a user-typed skill to its canonical name when it is in the skill bank."""
+    bank = skill_bank if skill_bank is not None else SKILL_BANK
     key = (name or "").strip().lower()
     if not key:
         return ""
-    if key in SKILL_BANK:
+    if key in bank:
         return key
-    for canonical, aliases in SKILL_BANK.items():
+    for canonical, aliases in bank.items():
         if key in (a.lower() for a in aliases):
             return canonical
     return key
@@ -314,6 +320,34 @@ _EDUCATION_WORDS = re.compile(
 )
 
 
+def _date_intervals(text: str, year_now: int) -> List[Tuple[int, int]]:
+    """Employment-style date ranges found in ``text`` (lines about education are skipped)."""
+    intervals: List[Tuple[int, int]] = []
+    for line in (text or "").splitlines():
+        if _EDUCATION_WORDS.search(line):
+            continue
+        for match in _DATE_RANGE.finditer(line):
+            start = int(match.group(1))
+            end_raw = match.group(2).lower()
+            end = year_now if end_raw in ("present", "current", "now") else int(end_raw)
+            if start <= end <= year_now + 1 and end - start <= 50:
+                intervals.append((start, end))
+    return intervals
+
+
+def _merge_intervals(intervals: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
 def extract_experience_years(text: str, current_year: Optional[int] = None) -> float:
     """Best-effort years of professional experience, between 0 and 40.
 
@@ -332,27 +366,8 @@ def extract_experience_years(text: str, current_year: Optional[int] = None) -> f
             except ValueError:
                 continue
 
-    intervals: List[Tuple[int, int]] = []
-    for line in text.splitlines():
-        if _EDUCATION_WORDS.search(line):
-            continue
-        for match in _DATE_RANGE.finditer(line):
-            start = int(match.group(1))
-            end_raw = match.group(2).lower()
-            end = year_now if end_raw in ("present", "current", "now") else int(end_raw)
-            if start <= end <= year_now + 1 and end - start <= 50:
-                intervals.append((start, end))
-
-    dated = 0.0
-    if intervals:
-        intervals.sort()
-        merged = [list(intervals[0])]
-        for start, end in intervals[1:]:
-            if start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], end)
-            else:
-                merged.append([start, end])
-        dated = float(sum(end - start for start, end in merged))
+    merged = _merge_intervals(_date_intervals(text, year_now))
+    dated = float(sum(end - start for start, end in merged))
 
     return float(min(40.0, max(stated, dated, 0.0)))
 
@@ -382,6 +397,10 @@ _GENDERED_RE = re.compile(
 _HEADING_WORDS = frozenset(
     "resume curriculum vitae cv profile summary objective experience education skills projects "
     "contact details personal information work professional".split()
+)
+_ROLE_WORDS = frozenset(
+    "developer engineer analyst scientist manager designer intern fresher consultant architect administrator "
+    "specialist student programmer lead director officer".split()
 )
 _NAME_LINE_RE = re.compile(r"^[A-Z][A-Za-z'\u2019.\-]+(?: [A-Z][A-Za-z'\u2019.\-]+){1,3}$")
 
@@ -420,7 +439,8 @@ def anonymize_text(text: str) -> str:
         if not stripped:
             continue
         words = {w.lower() for w in stripped.split()}
-        if _NAME_LINE_RE.match(stripped) and not (words & _HEADING_WORDS):
+        looks_like_title = bool(words & _HEADING_WORDS) or bool(words & _ROLE_WORDS) or bool(extract_skills(stripped))
+        if _NAME_LINE_RE.match(stripped) and not looks_like_title:
             lines[index] = "[NAME]"
         break  # only the first non-empty line is treated as a possible name
     out = "\n".join(lines)
@@ -445,12 +465,25 @@ def _keyword_set(text: str, limit: int = 40) -> List[str]:
     return [w for w, _ in ranked[:limit]]
 
 
+def _normalize_weights(weights: Optional[Sequence[float]]) -> Tuple[float, float, float]:
+    """Three non-negative weights, or the defaults when the input is unusable or all zero."""
+    try:
+        values = [max(0.0, float(w)) for w in weights]  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return DEFAULT_WEIGHTS
+    if len(values) != 3 or sum(values) <= 0:
+        return DEFAULT_WEIGHTS
+    return (values[0], values[1], values[2])
+
+
 def score_candidate(
     resume_text: str,
     required_skills: Sequence[str],
     jd_text: str = "",
     min_years: float = 0.0,
     current_year: Optional[int] = None,
+    weights: Optional[Sequence[float]] = None,
+    skill_bank: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, object]:
     """Deterministic, explainable 0-100 score.
 
@@ -460,12 +493,13 @@ def score_candidate(
       * job-description keyword overlap  15
     """
     text = resume_text or ""
+    bank = skill_bank if skill_bank is not None else SKILL_BANK
     reasons: List[str] = []
     required = _dedupe_keep_order(
-        s for s in (canonical_skill(x) for x in (required_skills or [])) if s
+        s for s in (canonical_skill(x, bank) for x in (required_skills or [])) if s
     )
     if not required and (jd_text or "").strip():
-        required = extract_skills(jd_text)
+        required = extract_skills(jd_text, bank)
         if required:
             reasons.append("No required skills were configured, so skills found in the job description were used.")
 
@@ -487,10 +521,10 @@ def score_candidate(
         empty["reasons"] = reasons + ["Resume is empty, so the score is 0."]
         return empty
 
-    matched = [s for s in required if has_skill(text, s)]
+    matched = [s for s in required if has_skill(text, s, bank)]
     missing = [s for s in required if s not in matched]
     years = extract_experience_years(text, current_year)
-    all_found = extract_skills(text)
+    all_found = extract_skills(text, bank)
     extra = [s for s in all_found if s not in required]
 
     jd_keywords = _keyword_set(jd_text)
@@ -501,12 +535,13 @@ def score_candidate(
     skill_fraction = (len(matched) / len(required)) if required else None
     exp_fraction = min(years / min_years, 1.0) if min_years > 0 else None
 
+    w_skill, w_exp, w_kw = _normalize_weights(weights)
     components = [
-        ("skill_points", WEIGHT_SKILLS, skill_fraction),
-        ("experience_points", WEIGHT_EXPERIENCE, exp_fraction),
-        ("keyword_points", WEIGHT_KEYWORDS, kw_fraction),
+        ("skill_points", w_skill, skill_fraction),
+        ("experience_points", w_exp, exp_fraction),
+        ("keyword_points", w_kw, kw_fraction),
     ]
-    active = [(key, w, f) for key, w, f in components if f is not None]
+    active = [(key, w, f) for key, w, f in components if f is not None and w > 0]
     total_weight = sum(w for _, w, _ in active)
 
     result = dict(empty)
@@ -554,6 +589,8 @@ def screen_resumes(
     min_years: float = 0.0,
     anonymize: bool = True,
     current_year: Optional[int] = None,
+    weights: Optional[Sequence[float]] = None,
+    skill_bank: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[List[Dict[str, object]], List[str]]:
     """Score and rank ``(file_name, text)`` pairs. Returns ``(ranked_results, warnings)``."""
     warnings: List[str] = []
@@ -572,9 +609,13 @@ def screen_resumes(
         seen[fingerprint] = file_name
 
         working_text = anonymize_text(text) if anonymize else text
-        detail = score_candidate(working_text, required_skills, jd_text, min_years, current_year)
+        detail = score_candidate(working_text, required_skills, jd_text, min_years, current_year, weights, skill_bank)
         detail["file_name"] = file_name
         detail["text_used"] = working_text
+        detail["original_text"] = text[:20000]
+        detail["fingerprint"] = fingerprint
+        detail["redactions"] = count_redactions(working_text) if anonymize else 0
+        detail["proxy_flags"] = detect_proxy_risks(working_text, current_year)
         results.append(detail)
 
     # Deterministic order: score desc, then more matched skills, then file name.
@@ -583,6 +624,502 @@ def screen_resumes(
         item["rank"] = position
         item["candidate_id"] = f"Candidate {position:03d}"
     return results, warnings
+
+
+# --------------------------------------------------------------------------------------
+# Custom skills
+# --------------------------------------------------------------------------------------
+
+
+def merged_skill_bank(custom: Optional[Dict[str, List[str]]] = None) -> Dict[str, List[str]]:
+    """Built-in skills plus the user's own (never mutates the global ``SKILL_BANK``)."""
+    bank = {name: list(aliases) for name, aliases in SKILL_BANK.items()}
+    for name, aliases in (custom or {}).items():
+        bank[name] = _dedupe_keep_order(bank.get(name, []) + list(aliases))
+    return bank
+
+
+def parse_custom_skills(text: str, max_skills: int = 100) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Parse lines like ``rag = retrieval augmented generation, rag pipeline``.
+
+    Returns ``(skills, warnings)``. Blank lines and lines starting with ``#`` are ignored.
+    """
+    skills: Dict[str, List[str]] = {}
+    warnings: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, alias_part = line.partition("=")
+        name = name.strip().lower()
+        if not name or len(name) > 40:
+            warnings.append(f"Skipped an invalid custom skill line: '{line[:40]}'.")
+            continue
+        if len(skills) >= max_skills and name not in skills:
+            warnings.append(f"Only the first {max_skills} custom skills are used.")
+            break
+        aliases = [a.strip().lower() for a in alias_part.split(",") if 0 < len(a.strip()) <= 40]
+        skills[name] = _dedupe_keep_order([name] + aliases)
+    return skills, warnings
+
+
+def weights_percent(weights: Optional[Sequence[float]]) -> Tuple[float, float, float]:
+    """The weights as percentages that add up to 100 (defaults if unusable)."""
+    w = _normalize_weights(weights)
+    total = sum(w)
+    return tuple(round(100.0 * x / total, 1) for x in w)  # type: ignore[return-value]
+
+
+# --------------------------------------------------------------------------------------
+# Proxy-risk flags
+# --------------------------------------------------------------------------------------
+
+_PROXY_RULES = [
+    ("Institution", "medium", re.compile(r"\b(?:university|college|institute)\b[^\n,;|]{0,40}", re.I),
+     "Where someone studied can signal region, income or community background."),
+    ("Institution", "medium", re.compile(r"\b(?:IIT|IIM|NIT|BITS|MIT)\b[^\n,;|]{0,30}"),
+     "Institution prestige can act as a proxy for socioeconomic background."),
+    ("Location", "medium", re.compile(r"\b(?:based in|located in|resident of|relocat\w+ to)\b[^\n.;|]{0,40}", re.I),
+     "Place of residence can correlate with ethnicity, caste or income."),
+    ("Location", "medium", re.compile(r"\b(?:pin|zip|postal)\s*(?:code)?\s*[:\-]?\s*\d{5,6}\b", re.I),
+     "Postal codes can correlate with ethnicity, caste or income."),
+    ("Age / graduation year", "high", re.compile(r"\b(?:graduated|graduation|class of|batch of|passed out)\b[^\n.;|]{0,25}\b(?:19|20)\d{2}\b", re.I),
+     "Graduation year reveals approximate age."),
+    ("Age / graduation year", "high", re.compile(r"\b\d{2}\s*years?\s*old\b", re.I), "States age directly."),
+    ("Career gap or leave", "high", re.compile(r"\b(?:career break|gap year|sabbatical|maternity|paternity|parental leave|caregiv\w+|time off)\b[^\n.;|]{0,30}", re.I),
+     "Gaps and leave correlate with gender, caregiving and health."),
+    ("Family / marital status", "high", re.compile(r"\b(?:married|divorced|widowed|spouse|husband|wife|pregnan\w+|my children|kids)\b", re.I),
+     "Family status is a protected or sensitive characteristic in many places."),
+    ("Religion / community", "high", re.compile(r"\b(?:church|temple|mosque|masjid|gurdwara|synagogue|islamic|hindu|christian|muslim|sikh|jewish|buddhist)\b[^\n,;|]{0,30}", re.I),
+     "Can reveal religion or community."),
+    ("Nationality / work authorization", "medium", re.compile(r"\b(?:citizen(?:ship)?|visa|work permit|green card|nationality|native speaker|mother tongue)\b[^\n.;|]{0,30}", re.I),
+     "Can reveal national origin or immigration status."),
+    ("Health / disability", "high", re.compile(r"\b(?:disabilit\w+|wheelchair|chronic|medical leave|health condition)\b", re.I),
+     "Health and disability information should not influence screening."),
+]
+
+
+def detect_proxy_risks(text: str, current_year: Optional[int] = None) -> List[Dict[str, str]]:
+    """Heuristically list details that can stand in for protected characteristics.
+
+    These are flags for a human to consider hiding or ignoring, not accusations, and the
+    list is not exhaustive.
+    """
+    if not text:
+        return []
+    flags: List[Dict[str, str]] = []
+    seen = set()
+    per_category: Dict[str, int] = {}
+
+    def add(category: str, level: str, evidence: str, why: str) -> None:
+        key = (category, evidence.lower())
+        if key in seen or per_category.get(category, 0) >= 3 or len(flags) >= 15:
+            return
+        seen.add(key)
+        per_category[category] = per_category.get(category, 0) + 1
+        flags.append({"category": category, "level": level, "evidence": evidence, "why": why})
+
+    for category, level, pattern, why in _PROXY_RULES:
+        for match in pattern.finditer(text):
+            evidence = re.sub(r"\s+", " ", match.group(0)).strip()[:70]
+            add(category, level, evidence, why)
+
+    year_now = current_year if current_year is not None else date.today().year
+    merged = _merge_intervals(_date_intervals(text, year_now))
+    for previous, following in zip(merged, merged[1:]):
+        gap = following[0] - previous[1]
+        if gap >= 2:
+            add(
+                "Career gap or leave", "high", f"{previous[1]} to {following[0]}: no dated role for {gap} years",
+                "Gaps and leave correlate with gender, caregiving and health.",
+            )
+    return flags
+
+
+# --------------------------------------------------------------------------------------
+# Before / after anonymization view
+# --------------------------------------------------------------------------------------
+
+_REDACTION_RE = re.compile(r"\[(?:EMAIL|URL|PHONE|NAME|DOB|ADDRESS|G|REDACTED PERSONAL DETAIL)\]")
+
+
+def count_redactions(text: str) -> int:
+    return len(_REDACTION_RE.findall(text or ""))
+
+
+def redaction_diff_html(original: str, anonymized: str, limit: int = 3000) -> str:
+    """Side-by-side view with removed text (left) and its replacement (right) highlighted."""
+    a_tokens = re.findall(r"\s+|\S+", (original or "")[:limit])
+    b_tokens = re.findall(r"\s+|\S+", (anonymized or "")[:limit])
+    matcher = difflib.SequenceMatcher(a=a_tokens, b=b_tokens, autojunk=False)
+    left: List[str] = []
+    right: List[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        a_seg = "".join(a_tokens[i1:i2])
+        b_seg = "".join(b_tokens[j1:j2])
+        if tag == "equal":
+            left.append(_esc(a_seg))
+            right.append(_esc(b_seg))
+            continue
+        if a_seg:
+            left.append(f'<mark class="fh-del">{_esc(a_seg)}</mark>')
+        if b_seg:
+            right.append(f'<mark class="fh-add">{_esc(b_seg)}</mark>')
+    return (
+        '<div class="fh-diff"><div><h6>Original</h6><pre>' + "".join(left) + "</pre></div>"
+        '<div><h6>After anonymization</h6><pre>' + "".join(right) + "</pre></div></div>"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Bias stress test
+# --------------------------------------------------------------------------------------
+
+ALT_NAMES = ["Aarav Mehta", "Emily Carter", "Mohammed Al-Farsi", "Wei Zhang", "Chioma Okafor", "Maria Gonzalez"]
+_GENDER_SWAPS = {
+    "he": "she", "she": "he", "him": "her", "his": "her", "hers": "his", "her": "his",
+    "himself": "herself", "herself": "himself", "male": "female", "female": "male",
+}
+_GENDER_RE = re.compile(r"\b(?:" + "|".join(sorted(_GENDER_SWAPS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+_NAME_LABEL_VALUE_RE = re.compile(r"(?i)^(?:candidate\s+name|full\s+name|name)\s*[:\-]\s*(.+)$")
+
+
+def swap_gender_terms(text: str) -> str:
+    """Swap gendered pronouns and words (he/she, his/her, male/female), keeping case."""
+
+    def replace(match: "re.Match[str]") -> str:
+        word = match.group(0)
+        new = _GENDER_SWAPS[word.lower()]
+        if word.isupper() and len(word) > 1:
+            return new.upper()
+        return new.capitalize() if word[0].isupper() else new
+
+    return _GENDER_RE.sub(replace, text or "")
+
+
+def detect_name(text: str) -> Optional[str]:
+    """Best-effort guess of the candidate's name (labelled line, else a name-like first line)."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for line in lines[:6]:
+        match = _NAME_LABEL_VALUE_RE.match(line)
+        if match and match.group(1).strip():
+            return match.group(1).strip()[:60]
+    if lines:
+        first = lines[0]
+        words = {w.lower() for w in first.split()}
+        if _NAME_LINE_RE.match(first) and not (words & _HEADING_WORDS):
+            return first
+    return None
+
+
+def swap_name(text: str, old: str, new: str) -> str:
+    """Replace the full name, then each name part, with the new name (case-insensitive)."""
+    out = re.sub(re.escape(old), new, text or "", flags=re.IGNORECASE)
+    new_parts = new.split()
+    for index, part in enumerate(old.split()):
+        if len(part) >= 3 and new_parts:
+            out = re.sub(r"\b" + re.escape(part) + r"\b", new_parts[min(index, len(new_parts) - 1)], out, flags=re.IGNORECASE)
+    return out
+
+
+def bias_stress_test(
+    resume_text: str,
+    required_skills: Sequence[str],
+    jd_text: str = "",
+    min_years: float = 0.0,
+    weights: Optional[Sequence[float]] = None,
+    skill_bank: Optional[Dict[str, List[str]]] = None,
+    anonymize: bool = False,
+    current_year: Optional[int] = None,
+    tolerance: float = 0.05,
+) -> Dict[str, object]:
+    """Re-score the same resume with the name and gendered words changed.
+
+    A deterministic scorer that ignores identity should give the same score every time.
+    This checks that property only; it does not prove the whole process is unbiased.
+    """
+    name = detect_name(resume_text)
+    variants: List[Tuple[str, str]] = [("Original", resume_text)]
+    alt_names = [n for n in ALT_NAMES if not name or n.lower() != name.lower()]
+    if name:
+        for alt in alt_names[:4]:
+            variants.append((f"Name changed to {alt}", swap_name(resume_text, name, alt)))
+    variants.append(("Gender terms swapped", swap_gender_terms(resume_text)))
+    if name and alt_names:
+        variants.append(("Name and gender terms swapped", swap_gender_terms(swap_name(resume_text, name, alt_names[-1]))))
+
+    rows: List[Dict[str, object]] = []
+    base: Optional[float] = None
+    for label, variant_text in variants:
+        used = anonymize_text(variant_text) if anonymize else variant_text
+        score = float(score_candidate(used, required_skills, jd_text, min_years, current_year, weights, skill_bank)["score"])
+        if base is None:
+            base = score
+        rows.append(
+            {
+                "variant": label,
+                "score": score,
+                "delta": round(score - base, 1),
+                "text_changed": variant_text != resume_text,
+            }
+        )
+    max_abs = max(abs(float(r["delta"])) for r in rows)
+    return {"name_detected": name is not None, "rows": rows, "max_abs_delta": max_abs, "passed": max_abs <= tolerance}
+
+
+# --------------------------------------------------------------------------------------
+# Statistics for the fairness audit
+# --------------------------------------------------------------------------------------
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    """95% Wilson confidence interval for a proportion (unknown when ``n`` is 0)."""
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denominator = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denominator
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denominator
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def two_proportion_z_test(x1: int, n1: int, x2: int, n2: int) -> Optional[Dict[str, float]]:
+    """Two-sided z-test for the difference between two selection rates (group 1 - group 2)."""
+    if n1 <= 0 or n2 <= 0:
+        return None
+    p1, p2 = x1 / n1, x2 / n2
+    pooled = (x1 + x2) / (n1 + n2)
+    se = math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2))
+    if se == 0:
+        z, p_value = 0.0, 1.0
+    else:
+        z = (p1 - p2) / se
+        p_value = math.erfc(abs(z) / math.sqrt(2))
+    se_diff = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+    diff = p1 - p2
+    return {
+        "z": z,
+        "p_value": min(1.0, max(0.0, p_value)),
+        "diff": diff,
+        "ci_low": diff - 1.96 * se_diff,
+        "ci_high": diff + 1.96 * se_diff,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Human review log
+# --------------------------------------------------------------------------------------
+
+REVIEW_DECISIONS = ("Not reviewed", "Advance", "Hold", "Reject")
+
+
+def validate_review_entry(decision: str, reason: str) -> Optional[str]:
+    """Return an error message, or ``None`` when the entry is acceptable."""
+    if decision not in REVIEW_DECISIONS:
+        return "Unknown decision."
+    if len(reason or "") > 500:
+        return "The reason is longer than 500 characters."
+    if decision in ("Hold", "Reject") and not (reason or "").strip():
+        return "A job-related reason is required for Hold and Reject."
+    return None
+
+
+def review_log_dataframe(log: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    columns = ["Time (UTC)", "Candidate", "Score", "Decision", "Reason"]
+    rows = [
+        {
+            "Time (UTC)": e.get("time", ""),
+            "Candidate": e.get("candidate", ""),
+            "Score": e.get("score", ""),
+            "Decision": e.get("decision", ""),
+            "Reason": e.get("reason", ""),
+        }
+        for e in log.values()
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def now_utc_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# --------------------------------------------------------------------------------------
+# Score distribution
+# --------------------------------------------------------------------------------------
+
+
+def score_histogram_html(scores: Sequence[float], bins: int = 10) -> str:
+    bins = max(1, int(bins))
+    width = 100.0 / bins
+    counts = [0] * bins
+    for score in scores:
+        counts[min(int(clamp(float(score)) // width), bins - 1)] += 1
+    peak = max(counts) or 1
+    columns = []
+    for index, count in enumerate(counts):
+        low, high = index * width, (index + 1) * width
+        tone = score_tone((low + high) / 2)
+        height = 3 + int(round(100 * count / peak)) if count else 3
+        color = _TONE_COLOR[tone] if count else "var(--border)"
+        columns.append(
+            f'<div class="fh-hist-col"><div class="fh-hist-count">{count if count else ""}</div>'
+            f'<div class="fh-hist-bar" style="height:{height}px;background:{color}"></div>'
+            f'<div class="fh-hist-label">{low:g}-{high:g}</div></div>'
+        )
+    return '<div class="fh-hist">' + "".join(columns) + "</div>"
+
+
+# --------------------------------------------------------------------------------------
+# Downloadable audit report (standalone HTML; print to PDF from the browser)
+# --------------------------------------------------------------------------------------
+
+REPORT_CSS = (
+    "body{font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#0f172a;margin:0;background:#f4f6fb;}"
+    ".wrap{max-width:980px;margin:0 auto;padding:32px 24px 64px;}"
+    "h1{font-size:28px;margin:0 0 4px;}h2{font-size:19px;margin:32px 0 10px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;}"
+    "h3{font-size:15px;margin:18px 0 6px;}.muted{color:#64748b;font-size:13px;}"
+    "table{width:100%;border-collapse:collapse;background:#fff;font-size:13px;margin:8px 0;}"
+    "th,td{border:1px solid #e2e8f0;padding:7px 9px;text-align:left;vertical-align:top;}th{background:#f1f4fa;}"
+    ".card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 16px;margin:10px 0;page-break-inside:avoid;}"
+    ".banner{background:#fef3c7;color:#92400e;padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13px;}"
+    ".ok{color:#047857;font-weight:600;}.bad{color:#b91c1c;font-weight:600;}"
+    "@media print{body{background:#fff;}.wrap{padding:0;}}"
+)
+
+LIMITATIONS_TEXT = (
+    "Masking identifying details does not make a hiring process unbiased: skills, schools, employers, gaps and writing style "
+    "can act as proxies for protected characteristics. Keyword scoring misses synonyms and context, and experience "
+    "extraction is heuristic. Fairness figures from synthetic data are simulations, not evidence about real hiring. The "
+    "bias stress test checks only that scores do not change when names and gendered words change. This tool supports "
+    "human reviewers and must not be used to reject candidates automatically. Check local employment and data-protection "
+    "law, obtain consent for processing resumes, and audit real outcomes with proper statistical testing."
+)
+
+
+def _report_fairness_block(section: Dict[str, object]) -> str:
+    report = section["report"]
+    simulated = bool(section.get("simulated"))
+    rows = []
+    for group in sorted(report["rates"]):
+        low, high = report["intervals"][group]
+        rows.append(
+            f"<tr><td>{_esc(group)}</td><td>{report['counts'][group]}</td><td>{report['selected_counts'][group]}</td>"
+            f"<td>{report['rates'][group] * 100:.1f}%</td><td>{low * 100:.1f}% to {high * 100:.1f}%</td></tr>"
+        )
+    ratio = report["disparate_impact_ratio"]
+    if ratio is None:
+        ratio_text = "undefined"
+    else:
+        verdict = '<span class="ok">at or above 0.80</span>' if ratio >= 0.8 else '<span class="bad">below 0.80, flag for review</span>'
+        ratio_text = f"{ratio:.3f} ({verdict})"
+    sig = report.get("significance")
+    if sig:
+        sig_text = (
+            f"{_esc(sig['high_group'])} minus {_esc(sig['low_group'])}: {sig['diff'] * 100:.1f} points "
+            f"(95% CI {sig['ci_low'] * 100:.1f} to {sig['ci_high'] * 100:.1f}), p = {sig['p_value']:.3f}. "
+            + ("Statistically significant at the 5% level." if sig["significant"] else "Not statistically significant; the gap could be chance.")
+        )
+    else:
+        sig_text = "Not available (needs at least two groups)."
+    banner = '<div class="banner">SIMULATED data. This is not evidence about real candidates or a real hiring process.</div>' if simulated else ""
+    notes = "".join(f'<div class="muted">{_esc(n)}</div>' for n in report["notes"])
+    return (
+        f"<h3>{_esc(section['title'])}</h3>{banner}"
+        "<table><thead><tr><th>Group</th><th>People</th><th>Selected</th><th>Selection rate</th><th>95% interval</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+        f"<div>Demographic parity difference: <b>{report['demographic_parity_difference']:.3f}</b>. "
+        f"Disparate impact ratio: <b>{ratio_text}</b>.</div><div>Significance: {sig_text}</div>{notes}"
+    )
+
+
+def build_report_html(
+    results: Sequence[Dict[str, object]],
+    settings: Dict[str, object],
+    fairness_sections: Optional[Sequence[Dict[str, object]]] = None,
+    review_log: Optional[Sequence[Dict[str, object]]] = None,
+    generated_on: Optional[str] = None,
+    show_files: bool = False,
+) -> str:
+    """Build a self-contained HTML audit report (print it to PDF from the browser)."""
+    generated_on = generated_on or now_utc_text()
+    scores = [float(r["score"]) for r in results]
+    average = sum(scores) / len(scores) if scores else 0.0
+    w_skill, w_exp, w_kw = weights_percent(settings.get("weights"))
+    required = settings.get("required") or []
+    settings_rows = [
+        ("Resumes screened", str(len(results))),
+        ("Average score", f"{average:.1f}"),
+        ("Required skills", ", ".join(required) if required else "None configured (job description and minimum years used)"),
+        ("Minimum years of experience", f"{float(settings.get('min_years', 0) or 0):g}"),
+        ("Scoring weights", f"skills {w_skill:g}% / experience {w_exp:g}% / keywords {w_kw:g}%"),
+        ("Anonymization before scoring", "On" if settings.get("anonymize") else "Off"),
+        ("Shortlist size", str(settings.get("shortlist", ""))),
+    ]
+    settings_html = "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in settings_rows)
+
+    top_n = int(settings.get("shortlist", 0) or 0)
+    rank_rows = []
+    cards = []
+    for r in results:
+        name = _esc(r["candidate_id"]) + (f" ({_esc(r['file_name'])})" if show_files else "")
+        flags = r.get("proxy_flags", [])
+        rank_rows.append(
+            f"<tr><td>{int(r['rank'])}</td><td>{name}</td><td>{float(r['score']):.1f}</td><td>{float(r['years_experience']):g}</td>"
+            f"<td>{_esc(', '.join(r['matched_skills']) or '-')}</td><td>{_esc(', '.join(r['missing_skills']) or '-')}</td>"
+            f"<td>{len(flags)}</td><td>{'Yes' if int(r['rank']) <= top_n else ''}</td></tr>"
+        )
+        reasons = "".join(f"<li>{_esc(x)}</li>" for x in r["reasons"]) or "<li>No details.</li>"
+        flag_html = "".join(f"<li>{_esc(f['category'])}: {_esc(f['evidence'])}</li>" for f in flags) or "<li>None found by the heuristic checks.</li>"
+        cards.append(
+            f'<div class="card"><b>#{int(r["rank"])} {name}</b> - {float(r["score"]):.1f} / 100'
+            f'<div class="muted">Skills {float(r["skill_points"]):.1f} pts, experience {float(r["experience_points"]):.1f} pts, '
+            f'keywords {float(r["keyword_points"]):.1f} pts</div><h3>Why this score</h3><ul>{reasons}</ul>'
+            f"<h3>Proxy-risk flags</h3><ul>{flag_html}</ul></div>"
+        )
+
+    fairness_html = "".join(_report_fairness_block(s) for s in (fairness_sections or [])) or (
+        '<div class="muted">No fairness audit was run in this session.</div>'
+    )
+    if review_log:
+        log_rows = "".join(
+            f"<tr><td>{_esc(e.get('time', ''))}</td><td>{_esc(e.get('candidate', ''))}</td><td>{_esc(e.get('score', ''))}</td>"
+            f"<td>{_esc(e.get('decision', ''))}</td><td>{_esc(e.get('reason', ''))}</td></tr>"
+            for e in review_log
+        )
+        log_html = (
+            "<table><thead><tr><th>Time (UTC)</th><th>Candidate</th><th>Score</th><th>Decision</th><th>Reason</th></tr></thead>"
+            f"<tbody>{log_rows}</tbody></table>"
+        )
+    else:
+        log_html = '<div class="muted">No reviewer decisions were recorded.</div>'
+
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>FairHire audit report</title>'
+        f"<style>{REPORT_CSS}</style></head><body><div class=\"wrap\"><h1>FairHire audit report</h1>"
+        f'<div class="muted">Generated {_esc(generated_on)}. Decision support only; a human makes every decision.</div>'
+        f"<h2>Settings</h2><table>{settings_html}</table>"
+        "<h2>Ranking</h2><table><thead><tr><th>Rank</th><th>Candidate</th><th>Score</th><th>Years</th><th>Matched skills</th>"
+        "<th>Missing skills</th><th>Proxy flags</th><th>Shortlist</th></tr></thead><tbody>"
+        + "".join(rank_rows)
+        + "</tbody></table><h2>Score explanations</h2>"
+        + "".join(cards)
+        + f"<h2>Fairness audit</h2>{fairness_html}<h2>Reviewer decisions</h2>{log_html}"
+        f"<h2>Limitations and responsible use</h2><p>{_esc(LIMITATIONS_TEXT)}</p></div></body></html>"
+    )
+
+
+def synthetic_fairness_sections(syn: Optional[pd.DataFrame]) -> List[Dict[str, object]]:
+    if syn is None or len(syn) == 0:
+        return []
+    sections = []
+    for title, column in (
+        ("Merit-only ranking (simulated)", "selected_merit_only"),
+        ("Biased process with simulated reviewer penalty (simulated)", "selected_biased_process"),
+    ):
+        sections.append({"title": title, "report": fairness_report(syn["group"].tolist(), syn[column].tolist()), "simulated": True})
+    return sections
+
 
 
 def results_to_dataframe(results: Sequence[Dict[str, object]], include_file_names: bool = False) -> pd.DataFrame:
@@ -598,6 +1135,7 @@ def results_to_dataframe(results: Sequence[Dict[str, object]], include_file_name
             "Years (detected)": r["years_experience"],
             "Matched skills": ", ".join(r["matched_skills"]),
             "Missing skills": ", ".join(r["missing_skills"]),
+            "Proxy flags": "; ".join(sorted({f["category"] for f in r.get("proxy_flags", [])})),
             "Why": " ".join(r["reasons"]),
         }
         if include_file_names:
@@ -605,7 +1143,7 @@ def results_to_dataframe(results: Sequence[Dict[str, object]], include_file_name
         rows.append(row)
     columns = [
         "Rank", "Candidate", "Score", "Skills pts", "Experience pts", "Keyword pts",
-        "Years (detected)", "Matched skills", "Missing skills", "Why",
+        "Years (detected)", "Matched skills", "Missing skills", "Proxy flags", "Why",
     ] + (["File"] if include_file_names else [])
     return pd.DataFrame(rows, columns=columns)
 
@@ -656,10 +1194,13 @@ def disparate_impact_ratio(rates: Dict[str, float]) -> Optional[float]:
 def fairness_report(groups: Sequence[str], selected: Sequence[bool]) -> Dict[str, object]:
     rates = selection_rates(groups, selected)
     counts: Dict[str, int] = {}
-    for g in groups:
-        counts[g] = counts.get(g, 0) + 1
+    chosen: Dict[str, int] = {}
+    for group, flag in zip(groups, selected):
+        counts[group] = counts.get(group, 0) + 1
+        chosen[group] = chosen.get(group, 0) + (1 if bool(flag) else 0)
     dpd = demographic_parity_difference(rates)
     dir_ = disparate_impact_ratio(rates)
+    intervals = {g: wilson_interval(chosen[g], counts[g]) for g in counts}
     notes: List[str] = []
     if len(rates) < 2:
         notes.append("At least two groups are needed to compare selection rates.")
@@ -668,12 +1209,34 @@ def fairness_report(groups: Sequence[str], selected: Sequence[bool]) -> Dict[str
         notes.append("Small groups (<10 people): " + ", ".join(sorted(small)) + ". Results are statistically unreliable.")
     if dir_ is None and len(rates) >= 2:
         notes.append("Disparate impact ratio is undefined because nobody was selected.")
+
+    significance = None
+    if len(rates) >= 2:
+        ordered = sorted(rates, key=lambda g: (rates[g], g))
+        low_group, high_group = ordered[0], ordered[-1]
+        test = two_proportion_z_test(chosen[high_group], counts[high_group], chosen[low_group], counts[low_group])
+        if test is not None:
+            significance = {
+                "high_group": high_group,
+                "low_group": low_group,
+                "p_value": test["p_value"],
+                "z": test["z"],
+                "diff": test["diff"],
+                "ci_low": test["ci_low"],
+                "ci_high": test["ci_high"],
+                "significant": test["p_value"] < 0.05,
+            }
+        if len(rates) > 2:
+            notes.append("The p-value compares only the highest and lowest groups, with no multiple-comparison correction.")
     return {
         "counts": counts,
+        "selected_counts": chosen,
         "rates": rates,
+        "intervals": intervals,
         "demographic_parity_difference": dpd,
         "disparate_impact_ratio": dir_,
         "four_fifths_pass": (dir_ >= 0.8) if dir_ is not None else None,
+        "significance": significance,
         "notes": notes,
     }
 
@@ -790,6 +1353,36 @@ that signals background, or a career gap). Treat it as a risk-reducing step, not
 The demo experiment uses **synthetic** candidates whose qualifications are drawn from the same distribution for
 both groups. The "biased process" is a simulated reviewer penalty added only to show what the audit can detect.
 **These results are simulations, not evidence about real hiring.**
+
+### Adjustable weights
+The three weights can be changed with sliders and are rescaled to add up to 100%, so rankings update live. Any component
+you have not configured is skipped. Changing weights changes who ranks first, so record the weights you used (the report does).
+
+### Bias stress test
+Each resume is re-scored with its name replaced by other names and its gendered words swapped. The score should not move.
+This verifies one property of the scoring step only. It cannot detect bias from the criteria you choose, from proxies, or
+from the people reviewing the results.
+
+### Proxy-risk flags
+Pattern checks list details that can stand in for protected traits (school, location, graduation year, career gaps, family
+or religious details, nationality, health). They are heuristics that miss things and can over-flag, and they stay visible
+after anonymization. Consider hiding or ignoring them when reviewing.
+
+### Statistical significance
+For the highest and lowest selection rates the audit shows a 95% interval for each rate, the difference with its interval,
+and a two-sided two-proportion z-test. With small groups the test has little power; a non-significant result does not show
+that there is no bias. With three or more groups no multiple-comparison correction is applied.
+
+### Reviewer decisions and report
+You record Advance, Hold or Reject for each candidate, with a job-related reason required for Hold and Reject. The
+downloadable report bundles the settings, ranking, explanations, flags, fairness results and your decisions.
+
+### Accounts and privacy
+Recruiters sign in with an email and password (stored only as salted hashes). Each person sees only their own saved jobs,
+reports and audits. Administrators can manage accounts but cannot read anyone's saved data. Resumes are processed in memory
+and never stored; saved reports contain candidate numbers, scores, explanations and short evidence snippets for proxy flags.
+Email verification and email password reset work only if an email service is configured; otherwise an administrator resets
+passwords. On free hosting the local database can be wiped when the app restarts, so treat saved data as temporary.
 
 ### Limitations and responsible use
 * Masking identity does not make a process unbiased. Skills lists, schools, employers, gaps and writing style can
@@ -951,6 +1544,30 @@ hr {border-color: var(--border) !important;}
 .fh-intro-dots span:nth-child(2) {animation-delay: .2s;} .fh-intro-dots span:nth-child(3) {animation-delay: .4s;}
 @media (prefers-reduced-motion: reduce) {.fh-intro, .fh-intro * {animation-duration: 5s !important; animation-iteration-count: 1 !important;} .fh-intro-logo, .fh-intro-dots span {animation-name: none !important;}}
 .fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
+.fh-chip.warn {background: var(--warn_soft); color: var(--warn);}
+.fh-hist {display: flex; align-items: flex-end; gap: 6px; height: 175px; padding: .4rem .2rem 0; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: var(--shadow); margin-bottom: 1rem; padding: 1rem .8rem .5rem;}
+.fh-hist-col {flex: 1; text-align: center; display: flex; flex-direction: column; justify-content: flex-end; height: 100%;}
+.fh-hist-bar {width: 100%; border-radius: 6px 6px 2px 2px; min-height: 3px;}
+.fh-hist-count {font-size: .75rem; font-weight: 700; color: var(--text); min-height: 1rem;}
+.fh-hist-label {font-size: .66rem; color: var(--muted); margin-top: .25rem; white-space: nowrap;}
+.fh-diff {display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin-top: .5rem;}
+.fh-diff h6 {margin: 0 0 .25rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted) !important;}
+.fh-diff pre {margin: 0 !important; max-height: 240px;}
+mark.fh-del {background: var(--bad_soft); color: var(--bad); border-radius: 4px; padding: 0 2px;}
+mark.fh-add {background: var(--ok_soft); color: var(--ok); border-radius: 4px; padding: 0 2px;}
+[data-testid="stExpander"] {background: var(--surface2) !important; border: 1px solid var(--border) !important; border-radius: 12px !important;}
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary {background: transparent !important;}
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * {color: var(--text) !important;}
+[data-testid="stForm"] {border: 1px solid var(--border) !important; border-radius: 14px !important; background: var(--surface); padding: 1rem;}
+@media (max-width: 720px) {.fh-diff {grid-template-columns: 1fr;}}
+.fh-brand {display: flex; align-items: center; gap: .8rem;}
+.fh-brand-logo {width: 46px; height: 46px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; color: #fff;
+  background: linear-gradient(135deg, var(--primary), var(--primary2));}
+.fh-brand-name {font-weight: 800; font-size: 1.25rem; color: var(--text); line-height: 1.1;}
+.fh-brand-tag {color: var(--muted); font-size: .85rem;}
+.fh-auth-title {font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; margin: 1.1rem 0 .4rem; color: var(--text);}
+.fh-auth-sub {color: var(--muted); line-height: 1.55; margin-bottom: 1rem;}
 @media (max-width: 720px) {.block-container {padding: 4.2rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
 
@@ -1115,14 +1732,28 @@ def _score_cell(score: float) -> str:
     )
 
 
+def flag_chips_html(flags: Sequence[Dict[str, str]]) -> str:
+    if not flags:
+        return '<span class="fh-muted">None found by the heuristic checks</span>'
+    out = []
+    for flag in flags:
+        tone = "bad" if flag.get("level") == "high" else "warn"
+        out.append(
+            f'<span class="fh-chip {tone}" title="{_esc(flag.get("why", ""))}">'
+            f'{_esc(flag.get("category", ""))}: {_esc(flag.get("evidence", ""))}</span>'
+        )
+    return "".join(out)
+
+
 def results_table_html(results: Sequence[Dict[str, object]], top_n: int, show_files: bool = False) -> str:
-    head = ["Rank", "Candidate", "Score", "Years", "Matched skills", "Missing skills", "Shortlist"]
+    head = ["Rank", "Candidate", "Score", "Years", "Matched skills", "Missing skills", "Proxy flags", "Shortlist"]
     rows = []
     for r in results:
         name = _esc(r["candidate_id"])
         if show_files:
             name += f'<div class="fh-muted" style="font-size:.75rem">{_esc(r["file_name"])}</div>'
         shortlisted = int(r["rank"]) <= top_n
+        flag_count = len(r.get("proxy_flags", []))
         rows.append(
             "<tr>"
             f'<td><span class="fh-rank">{int(r["rank"])}</span></td>'
@@ -1131,6 +1762,7 @@ def results_table_html(results: Sequence[Dict[str, object]], top_n: int, show_fi
             f"<td>{float(r['years_experience']):g}</td>"
             f"<td>{chips_html(r['matched_skills'], 'ok', 6)}</td>"
             f"<td>{chips_html(r['missing_skills'], 'bad', 6)}</td>"
+            f"<td>{pill_html(str(flag_count), 'warn') if flag_count else pill_html('0', 'neutral')}</td>"
             f"<td>{pill_html('Shortlisted', 'ok') if shortlisted else pill_html('-', 'neutral')}</td>"
             "</tr>"
         )
@@ -1154,15 +1786,21 @@ def candidate_card_html(item: Dict[str, object], show_files: bool = False, open_
         ("Experience", float(item["experience_points"]), "#0EA5E9"),
         ("Keywords", float(item["keyword_points"]), "#F59E0B"),
     ]
-    stack = "".join(
-        f'<i style="width:{clamp(p):.1f}%;background:{color}"></i>' for _, p, color in parts
-    )
+    stack = "".join(f'<i style="width:{clamp(p):.1f}%;background:{color}"></i>' for _, p, color in parts)
     legend = "".join(
         f'<span><span class="fh-dot" style="background:{color}"></span>{_esc(name)} {p:.1f} pts</span>'
         for name, p, color in parts
     )
     reasons = "".join(f"<li>{_esc(r)}</li>" for r in item["reasons"]) or '<li class="fh-muted">No details.</li>'
-    raw = _esc(str(item.get("text_used", ""))[:3000])
+    used = str(item.get("text_used", ""))
+    original = str(item.get("original_text", used))
+    redactions = int(item.get("redactions", 0) or 0)
+    if redactions or used != original:
+        diff_summary = f"Before / after anonymization ({redactions} items masked)"
+        diff_body = redaction_diff_html(original, used)
+    else:
+        diff_summary = "Before / after anonymization"
+        diff_body = '<div class="fh-muted" style="margin-top:.5rem">Anonymization is off or nothing needed masking.</div>'
     return (
         f'<details class="fh-cand"{" open" if open_card else ""}><summary>'
         f'<span class="fh-rank">{int(item["rank"])}</span><span class="grow">{label}</span>'
@@ -1173,19 +1811,28 @@ def candidate_card_html(item: Dict[str, object], show_files: bool = False, open_
         f'<h5>Other skills detected</h5>{chips_html(item["extra_skills"], "neutral")}'
         f'<h5>Detected experience</h5><div>{float(item["years_experience"]):g} years</div>'
         f"<h5>Why this score</h5><ul>{reasons}</ul>"
-        f'<details class="fh-raw"><summary>View text used for scoring</summary><pre>{raw}</pre></details>'
+        f'<h5>Proxy-risk flags (still visible after anonymization)</h5>{flag_chips_html(item.get("proxy_flags", []))}'
+        f'<details class="fh-raw"><summary>{_esc(diff_summary)}</summary>{diff_body}</details>'
         "</div></details>"
     )
 
 
-def rates_bars_html(rates: Dict[str, float], counts: Optional[Dict[str, int]] = None) -> str:
+def rates_bars_html(
+    rates: Dict[str, float],
+    counts: Optional[Dict[str, int]] = None,
+    intervals: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> str:
     rows = []
     for index, group in enumerate(sorted(rates)):
         rate = clamp(rates[group] * 100.0)
         n = f" (n={counts[group]})" if counts and group in counts else ""
+        ci = ""
+        if intervals and group in intervals:
+            low, high = intervals[group]
+            ci = f" | 95% CI {low * 100:.0f}-{high * 100:.0f}%"
         rows.append(
             f'<div class="fh-rate"><div class="fh-rate-head"><span>{_esc(group)}</span>'
-            f"<span>{rate:.1f}%{_esc(n)}</span></div>"
+            f"<span>{rate:.1f}%{_esc(n)}{_esc(ci)}</span></div>"
             f'<div class="fh-bar"><i style="width:{rate:.1f}%;background:{_BAR_GRADIENTS[index % len(_BAR_GRADIENTS)]}"></i></div></div>'
         )
     return "".join(rows) or '<span class="fh-muted">No data.</span>'
@@ -1203,12 +1850,27 @@ def fairness_panel_html(title: str, report: Dict[str, object]) -> str:
     else:
         ratio_card = kpi_card("Disparate impact ratio", f"{ratio:.2f}", "below the 0.80 guide", "bad")
         status = pill_html("Flag for review", "bad")
+
+    sig = report.get("significance")
+    sig_html = ""
+    if sig:
+        p_value = float(sig["p_value"])
+        sig_pill = (
+            pill_html(f"Statistically significant (p = {p_value:.3f})", "warn")
+            if sig["significant"]
+            else pill_html(f"Could be chance (p = {p_value:.2f})", "neutral")
+        )
+        sig_html = (
+            f'<div style="margin-top:.5rem">{sig_pill}</div>'
+            f'<div class="fh-muted" style="font-size:.8rem;margin-top:.3rem">{_esc(sig["high_group"])} minus {_esc(sig["low_group"])}: '
+            f'{float(sig["diff"]) * 100:.1f} points (95% CI {float(sig["ci_low"]) * 100:.1f} to {float(sig["ci_high"]) * 100:.1f})</div>'
+        )
     notes = "".join(f'<div class="fh-muted" style="font-size:.8rem;margin-top:.3rem">{_esc(n)}</div>' for n in report["notes"])
     return (
         f'<div class="fh-panel"><div class="fh-panel-title">{_esc(title)}</div>'
-        f'{rates_bars_html(report["rates"], report["counts"])}'
+        f'{rates_bars_html(report["rates"], report["counts"], report.get("intervals"))}'
         + kpis_html([kpi_card("Parity difference", f"{dpd:.3f}", "0 means equal rates"), ratio_card])
-        + f"<div>{status}</div>{notes}</div>"
+        + f"<div>{status}</div>{sig_html}{notes}</div>"
     )
 
 
@@ -1242,16 +1904,465 @@ def df_table_html(df: pd.DataFrame, max_rows: int = 50) -> str:
 # --------------------------------------------------------------------------------------
 
 
+def stress_summary_html(results: Sequence[Dict[str, object]], tests: Sequence[Dict[str, object]]) -> str:
+    rows = []
+    for item, test in zip(results, tests):
+        status = (
+            pill_html("Unchanged", "ok")
+            if test["passed"]
+            else pill_html(f"Changed by {float(test['max_abs_delta']):.1f}", "bad")
+        )
+        rows.append(
+            f"<tr><td><b>{_esc(item['candidate_id'])}</b></td>"
+            f"<td>{'Yes' if test['name_detected'] else 'No (gender-term test only)'}</td>"
+            f"<td>{len(test['rows']) - 1}</td><td>{float(test['max_abs_delta']):.1f}</td><td>{status}</td></tr>"
+        )
+    return (
+        '<div class="fh-table-wrap"><table class="fh-table"><thead><tr><th>Candidate</th><th>Name found</th>'
+        "<th>Variants tested</th><th>Largest score change</th><th>Result</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+def stress_detail_html(test: Dict[str, object]) -> str:
+    rows = []
+    for row in test["rows"]:
+        delta = float(row["delta"])
+        tone = "ok" if abs(delta) <= 0.05 else "bad"
+        note = "" if row["text_changed"] or row["variant"] == "Original" else " (text identical: nothing to swap)"
+        rows.append(
+            f"<tr><td>{_esc(row['variant'])}{_esc(note)}</td><td>{_score_cell(float(row['score']))}</td>"
+            f"<td>{pill_html(f'{delta:+.1f}', tone)}</td></tr>"
+        )
+    return (
+        '<div class="fh-table-wrap"><table class="fh-table"><thead><tr><th>Variant</th><th>Score</th><th>Change</th></tr></thead><tbody>'
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Streamlit interface
+# --------------------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------------------
+# Accounts, dashboard and admin (UI)
+# --------------------------------------------------------------------------------------
+
+
+def auth_brand_html() -> str:
+    return (
+        '<div class="fh-brand"><div class="fh-brand-logo">⚖️</div><div><div class="fh-brand-name">FairHire</div>'
+        '<div class="fh-brand-tag">Fair hiring. Explainable AI.</div></div></div>'
+        '<div class="fh-auth-title">Smarter hiring starts here.</div>'
+        '<div class="fh-auth-sub">Screen candidates transparently, understand every score, and audit your hiring '
+        "process for potential bias.</div>"
+    )
+
+
+def job_settings_from_state(state: Dict[str, object]) -> Dict[str, object]:
+    """The job set-up worth saving (never any resume content)."""
+    return {
+        "required": list(state.get("req_skills", [])),
+        "extra": str(state.get("extra_skills_text", "")),
+        "custom_skills_text": str(state.get("custom_skills_text", "")),
+        "min_years": float(state.get("min_years", 0.0) or 0.0),
+        "weights": [state.get("w_skill", 60), state.get("w_exp", 25), state.get("w_kw", 15)],
+        "shortlist": int(state.get("shortlist", 3) or 3),
+    }
+
+
+def apply_job_to_state(state: Dict[str, object], job: Dict[str, object]) -> None:
+    """Load a saved job into the screening form (call before those widgets are created)."""
+    settings = job.get("settings") or {}
+    weights = list(settings.get("weights") or [60, 25, 15])[:3]
+    while len(weights) < 3:
+        weights.append(0)
+    state["jd_text"] = str(job.get("jd_text", ""))
+    state["custom_skills_text"] = str(settings.get("custom_skills_text", ""))
+    state["req_skills"] = [str(s) for s in settings.get("required", [])]
+    state["extra_skills_text"] = str(settings.get("extra", ""))
+    state["min_years"] = float(settings.get("min_years", 0.0) or 0.0)
+    state["shortlist"] = max(1, int(settings.get("shortlist", 3) or 3))
+    state["w_skill"], state["w_exp"], state["w_kw"] = (max(0, min(100, int(w))) for w in weights)
+
+
+def audit_summary(sections: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    out = []
+    for section in sections:
+        report = section["report"]
+        sig = report.get("significance")
+        ratio = report["disparate_impact_ratio"]
+        out.append(
+            {
+                "title": str(section["title"]),
+                "simulated": bool(section.get("simulated")),
+                "dpd": round(float(report["demographic_parity_difference"]), 3),
+                "dir": None if ratio is None else round(float(ratio), 3),
+                "p_value": None if not sig else round(float(sig["p_value"]), 4),
+                "groups": len(report["rates"]),
+            }
+        )
+    return {"sections": out}
+
+
+def describe_summary(kind: str, summary: Dict[str, object]) -> str:
+    if kind == "audit":
+        parts = []
+        for section in summary.get("sections", [])[:2]:
+            ratio = "n/a" if section.get("dir") is None else f"{section['dir']:.2f}"
+            tag = " (simulated)" if section.get("simulated") else ""
+            parts.append(f"parity gap {section.get('dpd', 0):.3f}, impact ratio {ratio}{tag}")
+        return "; ".join(parts) or "No metrics"
+    return f"{summary.get('resumes', '?')} resumes, top score {summary.get('top_score', '?')}"
+
+
+def build_audit_report_html(sections: Sequence[Dict[str, object]], generated_on: Optional[str] = None) -> str:
+    generated_on = generated_on or now_utc_text()
+    body = "".join(_report_fairness_block(s) for s in sections) or '<div class="muted">No fairness results.</div>'
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>FairHire fairness audit</title>'
+        f'<style>{REPORT_CSS}</style></head><body><div class="wrap"><h1>FairHire fairness audit</h1>'
+        f'<div class="muted">Generated {_esc(generated_on)}.</div><h2>Results</h2>{body}'
+        f"<h2>Limitations and responsible use</h2><p>{_esc(LIMITATIONS_TEXT)}</p></div></body></html>"
+    )
+
+
+def read_app_secrets(st) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Optional settings from Streamlit secrets: an [smtp] table and ``admin_email``."""
+    smtp_conf: Optional[Dict[str, str]] = None
+    admin_email: Optional[str] = None
+    try:
+        if "smtp" in st.secrets:
+            smtp_conf = {str(k): v for k, v in dict(st.secrets["smtp"]).items()}
+    except Exception:  # noqa: BLE001 - no secrets file is the normal case
+        smtp_conf = None
+    try:
+        value = st.secrets.get("admin_email")
+        admin_email = value if isinstance(value, str) and value.strip() else None
+    except Exception:  # noqa: BLE001
+        admin_email = None
+    return smtp_conf, admin_email
+
+
+def _set_view(state, view: str) -> None:
+    state["auth_view"] = view
+
+
+def sign_out(state) -> None:
+    """Forget the account and everything held in memory for this session."""
+    for key in list(state.keys()):
+        if key not in ("dark_mode", "intro_done"):
+            del state[key]
+
+
+def _show(st, text: str, tone: str = "bad", icon: str = "⛔") -> None:
+    st.markdown(note_html(text, tone, icon), unsafe_allow_html=True)
+
+
+def _send_code_email(smtp_conf, user: Dict[str, object], conn, purpose: str) -> Optional[str]:
+    code = auth.issue_code(conn, int(user["id"]), purpose)
+    subject = "Your FairHire verification code" if purpose == "verify" else "Your FairHire password reset code"
+    body = f"Your FairHire code is {code}. It expires in {auth.CODE_TTL_SECONDS // 60} minutes. If you did not ask for it, ignore this email."
+    ok, error = auth.send_email(smtp_conf, str(user["email"]), subject, body)
+    return None if ok else error
+
+
+def render_auth(st, state, conn, smtp_conf, admin_email) -> None:  # pragma: no cover - UI
+    smtp_ok = auth.smtp_configured(smtp_conf)
+    view = state.get("auth_view", "login")
+    _, middle, _ = st.columns([1, 1.5, 1])
+    with middle:
+        st.markdown('<div class="fh-card-marker"></div>' + auth_brand_html(), unsafe_allow_html=True)
+        flash = state.pop("auth_flash", None)
+        if flash:
+            _show(st, flash, "info", "✅")
+
+        if view == "signup":
+            st.markdown(section_html("Create your account"), unsafe_allow_html=True)
+            if auth.count_users(conn) == 0 and not admin_email:
+                st.caption("The first account created becomes the administrator.")
+            with st.form("signup_form"):
+                email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                password = st.text_input("Password", type="password", placeholder="Password (10+ characters)", label_visibility="collapsed")
+                confirm = st.text_input("Confirm password", type="password", placeholder="Confirm password", label_visibility="collapsed")
+                submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
+            if not smtp_ok:
+                st.caption("Email verification is off because no email service is configured.")
+            if submitted:
+                if password != confirm:
+                    _show(st, "The two passwords do not match.")
+                else:
+                    user, error = auth.create_user(conn, email, password, verified=not smtp_ok, admin_email=admin_email)
+                    if error:
+                        _show(st, error)
+                    elif smtp_ok:
+                        problem = _send_code_email(smtp_conf, user, conn, "verify")
+                        state["pending_email"] = user["email"]
+                        state["auth_view"] = "verify"
+                        state["auth_flash"] = "We emailed you a 6-digit code." if not problem else f"{problem} Use 'Send a new code'."
+                        st.rerun()
+                    else:
+                        state["user"] = user
+                        state["auth_view"] = "login"
+                        st.rerun()
+            st.button("Already have an account? Sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "verify":
+            st.markdown(section_html("Verify your email"), unsafe_allow_html=True)
+            pending = state.get("pending_email", "")
+            st.caption(f"Enter the 6-digit code we sent to {pending}.")
+            with st.form("verify_form"):
+                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
+                submitted = st.form_submit_button("Verify", type="primary", use_container_width=True)
+            if submitted:
+                user = auth.get_user_by_email(conn, pending)
+                if user and auth.check_code(conn, user["id"], "verify", code):
+                    auth.set_verified(conn, user["id"])
+                    state["auth_flash"] = "Email verified. You can sign in now."
+                    state["auth_view"] = "login"
+                    st.rerun()
+                else:
+                    _show(st, "That code is not valid or has expired.")
+            if st.button("Send a new code", use_container_width=True):
+                user = auth.get_user_by_email(conn, pending)
+                if user and not user["verified"]:
+                    problem = _send_code_email(smtp_conf, user, conn, "verify")
+                    _show(st, problem or "A new code is on its way.", "bad" if problem else "info", "✉️")
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "forgot":
+            st.markdown(section_html("Reset your password"), unsafe_allow_html=True)
+            if not smtp_ok:
+                _show(
+                    st,
+                    "Password reset by email is not set up for this app. Ask an administrator to reset your password. "
+                    "They will give you a temporary one that you change at your next sign-in.",
+                    "info",
+                    "ℹ️",
+                )
+            else:
+                with st.form("forgot_form"):
+                    email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                    submitted = st.form_submit_button("Email me a code", type="primary", use_container_width=True)
+                if submitted:
+                    user = auth.get_user_by_email(conn, email)
+                    if user:
+                        _send_code_email(smtp_conf, user, conn, "reset")
+                    state["pending_email"] = auth.normalize_email(email)
+                    state["auth_flash"] = "If that email has an account, a code has been sent."
+                    state["auth_view"] = "reset"
+                    st.rerun()
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "reset":
+            st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
+            with st.form("reset_form"):
+                email = st.text_input("Email address", value=state.get("pending_email", ""), placeholder="Email address", label_visibility="collapsed")
+                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
+                password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
+                confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
+                submitted = st.form_submit_button("Update password", type="primary", use_container_width=True)
+            if submitted:
+                user = auth.get_user_by_email(conn, email)
+                if password != confirm:
+                    _show(st, "The two passwords do not match.")
+                elif not (user and auth.check_code(conn, user["id"], "reset", code)):
+                    _show(st, "That code is not valid or has expired.")
+                else:
+                    problem = auth.set_password(conn, user["id"], password)
+                    if problem:
+                        _show(st, problem)
+                    else:
+                        state["auth_flash"] = "Password updated. You can sign in now."
+                        state["auth_view"] = "login"
+                        st.rerun()
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        else:
+            st.markdown(section_html("Welcome back"), unsafe_allow_html=True)
+            with st.form("login_form"):
+                email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                password = st.text_input("Password", type="password", placeholder="Password", label_visibility="collapsed")
+                submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+            if submitted:
+                user, error = auth.authenticate(conn, email, password)
+                if error:
+                    _show(st, error)
+                else:
+                    state["user"] = user
+                    st.rerun()
+            st.button("New to FairHire? Create an account", on_click=_set_view, args=(state, "signup"), use_container_width=True)
+            st.button("Forgot your password?", on_click=_set_view, args=(state, "forgot"), use_container_width=True)
+        st.caption("Resumes you upload are processed in memory and are never saved.")
+
+
+def render_must_change(st, state, conn, user) -> None:  # pragma: no cover - UI
+    _, middle, _ = st.columns([1, 1.5, 1])
+    with middle:
+        st.markdown('<div class="fh-card-marker"></div>' + auth_brand_html(), unsafe_allow_html=True)
+        st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
+        st.caption("An administrator gave you a temporary password. Set your own to continue.")
+        with st.form("must_change_form"):
+            current = st.text_input("Temporary password", type="password", placeholder="Temporary password", label_visibility="collapsed")
+            password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
+            confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
+            submitted = st.form_submit_button("Save password", type="primary", use_container_width=True)
+        if submitted:
+            if password != confirm:
+                _show(st, "The two passwords do not match.")
+            else:
+                problem = auth.change_password(conn, user["id"], current, password)
+                if problem:
+                    _show(st, problem)
+                else:
+                    state["user"] = auth.get_user(conn, user["id"])
+                    st.rerun()
+        st.button("Sign out", on_click=sign_out, args=(state,), use_container_width=True)
+
+
+def render_dashboard(st, state, conn, user) -> None:  # pragma: no cover - UI
+    uid = int(user["id"])
+    jobs = auth.list_jobs(conn, uid)
+    reports = auth.list_reports(conn, uid, "screening")
+    audits = auth.list_reports(conn, uid, "audit")
+    st.markdown(section_html("Your dashboard"), unsafe_allow_html=True)
+    st.markdown(
+        kpis_html([kpi_card("Saved jobs", len(jobs)), kpi_card("Saved reports", len(reports)), kpi_card("Fairness audits", len(audits))]),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        note_html(
+            "Private to your account. Resumes are never saved. Saved reports hold candidate numbers, scores, explanations and "
+            "short evidence snippets for proxy flags. On Streamlit Community Cloud, saved data can disappear when the app restarts.",
+            "info",
+            "🔒",
+        ),
+        unsafe_allow_html=True,
+    )
+    note = state.pop("dash_flash", None)
+    if note:
+        _show(st, note, "info", "✅")
+
+    st.markdown(section_html("Saved jobs"), unsafe_allow_html=True)
+    if not jobs:
+        st.markdown(empty_state_html("No saved jobs", "Open the Screening tab and use Save this job.", "💼"), unsafe_allow_html=True)
+    for job in jobs:
+        c1, c2, c3 = st.columns([5, 1, 1])
+        c1.markdown(f'<b>{_esc(job["title"])}</b><div class="fh-muted">{_esc(job["created_at"])}</div>', unsafe_allow_html=True)
+        if c2.button("Load", key=f"load_job_{job['id']}"):
+            full = auth.get_job(conn, uid, job["id"])
+            if full:
+                apply_job_to_state(state, full)
+                state["dash_flash"] = f"Loaded '{full['title']}'. Open the Screening tab to continue."
+                st.rerun()
+        if c3.button("Delete", key=f"del_job_{job['id']}"):
+            auth.delete_job(conn, uid, job["id"])
+            st.rerun()
+
+    for heading, kind, items in (("Saved reports", "screening", reports), ("Previous fairness audits", "audit", audits)):
+        st.markdown(section_html(heading), unsafe_allow_html=True)
+        if not items:
+            st.markdown(empty_state_html("Nothing saved yet", "Save one from the Review & report or Fairness audit tab.", "📁"), unsafe_allow_html=True)
+        for item in items:
+            c1, c2, c3 = st.columns([5, 1.4, 1])
+            c1.markdown(
+                f'<b>{_esc(item["title"])}</b><div class="fh-muted">{_esc(item["created_at"])} | {_esc(describe_summary(kind, item["summary"]))}</div>',
+                unsafe_allow_html=True,
+            )
+            html_text = auth.get_report_html(conn, uid, item["id"]) or ""
+            c2.download_button(
+                "Download", data=html_text.encode("utf-8"), file_name=f"fairhire_{kind}_{item['id']}.html",
+                mime="text/html", key=f"dl_{kind}_{item['id']}",
+            )
+            if c3.button("Delete", key=f"del_{kind}_{item['id']}"):
+                auth.delete_report(conn, uid, item["id"])
+                st.rerun()
+
+
+def render_admin(st, state, conn, user) -> None:  # pragma: no cover - UI
+    st.markdown(section_html("Administration"), unsafe_allow_html=True)
+    try:
+        users = auth.list_users(conn, int(user["id"]))
+    except PermissionError:
+        _show(st, "Administrator access is required.")
+        return
+    st.markdown(
+        note_html(
+            "You can manage accounts. You cannot see anyone's jobs, reports or resumes, only how many each person has.",
+            "info",
+            "🛡️",
+        ),
+        unsafe_allow_html=True,
+    )
+    table = pd.DataFrame(
+        [
+            {"Email": u["email"], "Role": u["role"], "Verified": "yes" if u["verified"] else "no",
+             "Jobs": u["jobs"], "Reports": u["reports"], "Created": u["created_at"]}
+            for u in users
+        ]
+    )
+    st.markdown(df_table_html(table, 200), unsafe_allow_html=True)
+    others = [u for u in users if u["id"] != user["id"]]
+    if not others:
+        st.caption("No other accounts yet.")
+        return
+    labels = [f"{u['email']} ({u['role']})" for u in others]
+    choice = st.selectbox("Account", labels, key="admin_target")
+    action = st.selectbox("Action", ["Make administrator", "Make recruiter", "Reset password", "Delete account"], key="admin_action")
+    confirm = st.checkbox("I understand this cannot be undone", key="admin_confirm")
+    if st.button("Apply", type="primary", key="admin_apply"):
+        target = others[labels.index(choice)]
+        if action in ("Reset password", "Delete account") and not confirm:
+            _show(st, "Tick the box to confirm.")
+        elif action == "Make administrator":
+            problem = auth.set_role(conn, user["id"], target["id"], "admin")
+            _show(st, problem or "Role updated.", "bad" if problem else "info", "✅")
+        elif action == "Make recruiter":
+            problem = auth.set_role(conn, user["id"], target["id"], "recruiter")
+            _show(st, problem or "Role updated.", "bad" if problem else "info", "✅")
+        elif action == "Reset password":
+            temporary, problem = auth.admin_reset_password(conn, user["id"], target["id"])
+            if problem:
+                _show(st, problem)
+            else:
+                _show(st, "Temporary password created. Share it with the user privately. They must change it when they sign in. It is shown only now.", "info", "🔑")
+                st.code(temporary)
+        else:
+            problem = auth.delete_user(conn, user["id"], target["id"])
+            if problem:
+                _show(st, problem)
+            else:
+                state["dash_flash"] = "Account deleted."
+                st.rerun()
+
+
 def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     import streamlit as st
 
     st.set_page_config(page_title="FairHire", page_icon="⚖️", layout="wide")
     state = st.session_state
-    state.setdefault("results", [])
-    state.setdefault("warnings", [])
-    state.setdefault("notice", "")
-    state.setdefault("synthetic", None)
-    state.setdefault("dark_mode", False)
+    defaults = {
+        "docs": [], "read_problems": [], "notice": "", "synthetic": None, "dark_mode": False,
+        "review_log": {}, "audit_report": None, "use_sample": False, "jd_text": "", "req_skills": [],
+        "min_years": 0.0, "shortlist": 3, "w_skill": 60, "w_exp": 25, "w_kw": 15,
+        "custom_skills_text": "", "extra_skills_text": "", "anonymize": True, "reveal_files": False,
+        "stress_raw": False, "auth_view": "login", "job_title": "", "report_title": "", "audit_title": "",
+    }
+    for key, value in defaults.items():
+        state.setdefault(key, value)
+
+    conn = auth.open_db()
+    smtp_conf, admin_email = read_app_secrets(st)
+    user = state.get("user")
+    if user:  # re-read every run so role changes and deleted accounts take effect immediately
+        user = auth.get_user(conn, user["id"])
+        if user is None:
+            sign_out(state)
+        else:
+            state["user"] = user
 
     top_left, top_right = st.columns([6, 1.3])
     with top_right:
@@ -1259,6 +2370,9 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     dark = bool(state.get("dark_mode"))
     with top_right:
         st.markdown(theme_label_html(dark), unsafe_allow_html=True)
+        if user:
+            st.markdown(f'<div class="fh-theme-label">{_esc(user["email"])} | {_esc(user["role"])}</div>', unsafe_allow_html=True)
+            st.button("Sign out", on_click=sign_out, args=(state,), use_container_width=True)
     st.markdown(theme_css(dark) + theme_marker_html(dark), unsafe_allow_html=True)
     try:  # second, independent way to apply the theme (see theme_script_html)
         import streamlit.components.v1 as components
@@ -1267,50 +2381,102 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     except Exception:  # noqa: BLE001 - purely a progressive enhancement
         pass
     with top_left:
-        st.markdown(hero_html(), unsafe_allow_html=True)
+        if user:
+            st.markdown(hero_html(), unsafe_allow_html=True)
 
     if not state.get("intro_done"):  # welcome screen: once per visit
         st.markdown(intro_html(), unsafe_allow_html=True)
         state["intro_done"] = True
 
-    tab_screen, tab_audit, tab_method = st.tabs(["📄 Screening", "📊 Fairness audit", "📘 Methodology"])
+    if not user:
+        render_auth(st, state, conn, smtp_conf, admin_email)
+        return
+    if user["must_change"]:
+        render_must_change(st, state, conn, user)
+        return
+    flash = state.pop("flash", None)
+    if flash:
+        st.markdown(note_html(flash[1], flash[0], "✅" if flash[0] == "info" else "⛔"), unsafe_allow_html=True)
+
+    is_admin = user["role"] == "admin"
+    tab_names = ["🏠 Dashboard", "📄 Screening", "📝 Review & report", "🧪 Bias stress test", "📊 Fairness audit", "📘 Methodology"]
+    if is_admin:
+        tab_names.append("🛡️ Admin")
+    tabs = st.tabs(tab_names)
+    tab_dash, tab_screen, tab_review, tab_stress, tab_audit, tab_method = tabs[:6]
+    tab_admin = tabs[6] if is_admin else None
+
+    with tab_dash:
+        render_dashboard(st, state, conn, user)
+
+    results: List[Dict[str, object]] = []
+    config: Dict[str, object] = {}
+    bank: Dict[str, List[str]] = SKILL_BANK
+    required: List[str] = []
+    weights: Tuple[float, float, float] = DEFAULT_WEIGHTS
+    run = False
 
     # ------------------------------------------------------------------ Screening tab
     with tab_screen:
         left, right = st.columns([1, 2], gap="large")
 
+        def load_demo() -> None:
+            state["use_sample"] = True
+            state["jd_text"] = SAMPLE_JOB_DESCRIPTION
+            state["req_skills"] = list(DEFAULT_REQUIRED_SKILLS)
+            state["min_years"] = 2.0
+            state["run_demo"] = True
+
         with left:
             st.markdown('<div class="fh-card-marker"></div>' + section_html("Job setup", 1), unsafe_allow_html=True)
-            use_sample = st.checkbox("Use sample job description and resumes (demo)", value=False)
-            jd_text = st.text_area(
-                "Job description",
-                value=SAMPLE_JOB_DESCRIPTION if use_sample else "",
-                height=160,
-                placeholder="Paste the job description here...",
-            )
-            required_selected = st.multiselect(
-                "Required skills",
-                options=sorted(SKILL_BANK.keys()),
-                default=DEFAULT_REQUIRED_SKILLS if use_sample else [],
-            )
-            custom_skills_text = st.text_input("Extra required skills (comma-separated)", value="")
+            st.button("✨ One-click demo", on_click=load_demo, use_container_width=True)
+            st.checkbox("Include the sample resumes (demo)", key="use_sample")
+            st.text_area("Job description", key="jd_text", height=150, placeholder="Paste the job description here...")
+            with st.expander("➕ Add your own skills"):
+                st.caption("One per line: skill = alias 1, alias 2")
+                st.text_area(
+                    "Custom skills", key="custom_skills_text", height=90, label_visibility="collapsed",
+                    placeholder="rag = retrieval augmented generation\nfigma",
+                )
+            custom_bank, custom_warns = parse_custom_skills(state["custom_skills_text"])
+            bank = merged_skill_bank(custom_bank)
+            state["req_skills"] = [s for s in state["req_skills"] if s in bank]
+            st.multiselect("Required skills", options=sorted(bank), key="req_skills")
+            st.text_input("Extra required skills (comma-separated)", key="extra_skills_text")
             n1, n2 = st.columns(2)
-            min_years = n1.number_input(
-                "Min. years", min_value=0.0, max_value=40.0, value=2.0 if use_sample else 0.0, step=0.5
-            )
-            shortlist_size = n2.number_input("Shortlist size", min_value=1, max_value=500, value=3, step=1)
-            anonymize = st.checkbox("Anonymize resumes before scoring", value=True)
-            reveal_files = st.checkbox("Show file names in results", value=False)
+            n1.number_input("Min. years", min_value=0.0, max_value=40.0, step=0.5, key="min_years")
+            n2.number_input("Shortlist size", min_value=1, max_value=500, step=1, key="shortlist")
+            with st.expander("⚖️ Scoring weights (live re-ranking)"):
+                st.slider("Required skills", 0, 100, key="w_skill")
+                st.slider("Experience", 0, 100, key="w_exp")
+                st.slider("Job-description keywords", 0, 100, key="w_kw")
+                if state["w_skill"] + state["w_exp"] + state["w_kw"] <= 0:
+                    st.caption("All weights are 0, so the defaults are used.")
+                else:
+                    wp = weights_percent((state["w_skill"], state["w_exp"], state["w_kw"]))
+                    st.caption(
+                        f"Effective weights: skills {wp[0]:g}% | experience {wp[1]:g}% | keywords {wp[2]:g}%. "
+                        "Parts you have not configured are skipped. Rankings update as you move the sliders."
+                    )
+            with st.expander("💾 Save this job to my dashboard"):
+                st.text_input("Job title", key="job_title", placeholder="e.g. Data Scientist, Q4")
+                if st.button("Save job", key="save_job_btn"):
+                    _job_id, problem = auth.save_job(
+                        conn, user["id"], state["job_title"], state["jd_text"], job_settings_from_state(state)
+                    )
+                    state["flash"] = ("bad", problem) if problem else ("info", "Job saved to your dashboard.")
+                    st.rerun()
+            st.checkbox("Anonymize resumes before scoring", key="anonymize")
+            st.checkbox("Show file names in results", key="reveal_files")
 
             st.markdown(section_html("Upload resumes", 2), unsafe_allow_html=True)
             files = st.file_uploader(
-                "TXT, PDF or DOCX (max 5 MB each)",
-                type=["txt", "pdf", "docx"],
-                accept_multiple_files=True,
+                "TXT, PDF or DOCX (max 5 MB each)", type=["txt", "pdf", "docx"], accept_multiple_files=True
             )
             run = st.button("Run screening", type="primary", use_container_width=True)
 
-        if run:
+        demo_requested = state.pop("run_demo", False)
+        if run or demo_requested:
             documents: List[Tuple[str, str]] = []
             problems: List[str] = []
             for uploaded in files or []:
@@ -1319,55 +2485,57 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                     problems.append(error)
                 else:
                     documents.append((uploaded.name, text))
-            if use_sample:
+            if state["use_sample"]:
                 documents.extend(SAMPLE_RESUMES.items())
+            state["docs"] = documents
+            state["read_problems"] = problems
+            state["notice"] = "" if documents else "Upload at least one readable resume, or tick the sample option."
 
-            custom = [s.strip() for s in custom_skills_text.split(",") if s.strip()]
-            required = _dedupe_keep_order(
-                s for s in (canonical_skill(x) for x in list(required_selected) + custom) if s
+        extras = [s.strip() for s in state["extra_skills_text"].split(",") if s.strip()]
+        required = _dedupe_keep_order(
+            s for s in (canonical_skill(x, bank) for x in list(state["req_skills"]) + extras) if s
+        )
+        weights = (state["w_skill"], state["w_exp"], state["w_kw"])
+        min_years = float(state["min_years"])
+        anonymize = bool(state["anonymize"])
+        reveal_files = bool(state["reveal_files"])
+        shortlist = int(state["shortlist"])
+        jd_text = state["jd_text"]
+
+        warns: List[str] = []
+        if state["docs"]:
+            results, warns = screen_resumes(
+                state["docs"], required, jd_text, min_years, anonymize, weights=weights, skill_bank=bank
             )
-
-            if not documents:
-                state["results"] = []
-                state["warnings"] = problems
-                state["notice"] = "Upload at least one readable resume, or tick the demo option."
-            else:
-                results, warns = screen_resumes(documents, required, jd_text, float(min_years), anonymize)
-                state["results"] = results
-                state["warnings"] = problems + warns
-                state["notice"] = ""
-                state["config"] = {
-                    "required": required,
-                    "jd_given": bool(jd_text.strip()),
-                    "min_years": float(min_years),
-                }
+        config = {
+            "required": required, "min_years": min_years, "weights": weights, "anonymize": anonymize,
+            "shortlist": shortlist, "jd_given": bool(jd_text.strip()), "custom_skills": len(custom_bank),
+        }
 
         with right:
             st.markdown(section_html("Results"), unsafe_allow_html=True)
             if state["notice"]:
                 st.markdown(note_html(state["notice"], "info", "ℹ️"), unsafe_allow_html=True)
-            for message in state["warnings"]:
+            for message in list(state["read_problems"]) + warns + custom_warns:
                 st.markdown(note_html(message, "warn", "⚠️"), unsafe_allow_html=True)
 
-            results = state["results"]
             if not results:
                 st.markdown(
                     empty_state_html(
                         "No results yet",
-                        "Set up the job on the left, upload resumes, then press Run screening.",
+                        "Press One-click demo, or set up the job, upload resumes and press Run screening.",
                     ),
                     unsafe_allow_html=True,
                 )
             else:
-                config = state.get("config", {})
-                if not config.get("required") and not config.get("jd_given") and config.get("min_years", 0) <= 0:
+                if not required and not config["jd_given"] and min_years <= 0:
                     st.markdown(
                         note_html("Nothing to score against. Add required skills, a job description or minimum years.", "bad", "⛔"),
                         unsafe_allow_html=True,
                     )
-
-                top_n = min(int(shortlist_size), len(results))
+                top_n = min(shortlist, len(results))
                 average = sum(float(r["score"]) for r in results) / len(results)
+                flagged = sum(1 for r in results if r["proxy_flags"])
                 st.markdown(
                     kpis_html(
                         [
@@ -1375,13 +2543,17 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                             kpi_card("Top score", f"{float(results[0]['score']):.1f}", "out of 100", score_tone(float(results[0]["score"]))),
                             kpi_card("Average score", f"{average:.1f}", "across all resumes"),
                             kpi_card("Shortlisted", top_n, "top-ranked candidates"),
+                            kpi_card("Proxy flags", flagged, "resumes with sensitive details", "warn" if flagged else "neutral"),
                         ]
                     ),
                     unsafe_allow_html=True,
                 )
-                st.markdown(results_table_html(results, top_n, bool(reveal_files)), unsafe_allow_html=True)
+                st.markdown(results_table_html(results, top_n, reveal_files), unsafe_allow_html=True)
 
-                export_df = results_to_dataframe(results, include_file_names=bool(reveal_files))
+                st.markdown(section_html("Score distribution"), unsafe_allow_html=True)
+                st.markdown(score_histogram_html([float(r["score"]) for r in results]), unsafe_allow_html=True)
+
+                export_df = results_to_dataframe(results, include_file_names=reveal_files)
                 export_df.insert(2, "Shortlist", ["Yes" if r["rank"] <= top_n else "" for r in results])
                 st.download_button(
                     "⬇️ Download ranking (CSV)",
@@ -1393,13 +2565,14 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 st.markdown(section_html("Why each candidate scored as they did"), unsafe_allow_html=True)
                 st.markdown(
                     "".join(
-                        candidate_card_html(item, bool(reveal_files), open_card=(index == 0))
+                        candidate_card_html(item, reveal_files, open_card=(index == 0))
                         for index, item in enumerate(results)
                     ),
                     unsafe_allow_html=True,
                 )
 
-    # ------------------------------------------------------------------ Audit tab
+    # ------------------------------------------------------------------ Fairness audit tab
+    # (built before the review tab so the report can include the latest simulation)
     with tab_audit:
         st.markdown(section_html("Fairness audit"), unsafe_allow_html=True)
         st.markdown(
@@ -1425,13 +2598,9 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         syn = state["synthetic"]
         if syn is not None and len(syn):
             col_m, col_b = st.columns(2, gap="large")
-            for column, title, flag in (
-                (col_m, "Merit-only ranking (no simulated bias)", "selected_merit_only"),
-                (col_b, "Biased process (simulated reviewer penalty)", "selected_biased_process"),
-            ):
-                report = fairness_report(syn["group"].tolist(), syn[flag].tolist())
+            for column, section in zip((col_m, col_b), synthetic_fairness_sections(syn)):
                 with column:
-                    st.markdown(fairness_panel_html(title, report), unsafe_allow_html=True)
+                    st.markdown(fairness_panel_html(section["title"], section["report"]), unsafe_allow_html=True)
 
             st.markdown(section_html("Synthetic data preview"), unsafe_allow_html=True)
             st.markdown(df_table_html(syn, 50), unsafe_allow_html=True)
@@ -1445,6 +2614,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         st.markdown(section_html("Audit your own outcomes table (optional)"), unsafe_allow_html=True)
         st.caption("Upload a CSV with one row per person, a group column and a selected / not-selected column.")
         outcomes = st.file_uploader("Outcomes CSV", type=["csv"], key="outcomes_csv")
+        state["audit_report"] = None
         if outcomes is not None:
             table = None
             try:
@@ -1456,15 +2626,177 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 s_col = st.selectbox("Selected column", list(table.columns), index=1)
                 try:
                     report = audit_uploaded_outcomes(table, g_col, s_col)
+                    state["audit_report"] = report
                     st.markdown(fairness_panel_html("Your outcomes", report), unsafe_allow_html=True)
                 except ValueError as exc:
                     st.markdown(note_html(str(exc), "bad", "⛔"), unsafe_allow_html=True)
             elif table is not None:
                 st.markdown(note_html("The CSV needs at least two columns.", "bad", "⛔"), unsafe_allow_html=True)
 
+        audit_sections = synthetic_fairness_sections(state["synthetic"])
+        if state["audit_report"]:
+            audit_sections.append({"title": "Uploaded outcomes table", "report": state["audit_report"], "simulated": False})
+        if audit_sections:
+            st.markdown(section_html("Save this audit"), unsafe_allow_html=True)
+            st.text_input("Audit title", key="audit_title", placeholder="e.g. Q4 audit, 15-point simulated bias")
+            if st.button("💾 Save audit to my dashboard", key="save_audit_btn"):
+                _aid, problem = auth.save_report(
+                    conn, user["id"], state["audit_title"], "audit",
+                    build_audit_report_html(audit_sections), audit_summary(audit_sections),
+                )
+                state["flash"] = ("bad", problem) if problem else ("info", "Audit saved to your dashboard.")
+                st.rerun()
+
+    # ------------------------------------------------------------------ Review & report tab
+    with tab_review:
+        st.markdown(section_html("Reviewer decisions"), unsafe_allow_html=True)
+        if not results:
+            st.markdown(
+                empty_state_html("Nothing to review yet", "Run a screening first, then record your decisions here.", "📝"),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                note_html(
+                    "You make the decisions. Record yours for each candidate; Hold and Reject need a reason that is related to the job.",
+                    "info",
+                    "🧑‍⚖️",
+                ),
+                unsafe_allow_html=True,
+            )
+            with st.form("review_form"):
+                for item in results:
+                    fingerprint = str(item["fingerprint"])[:12]
+                    saved = state["review_log"].get(fingerprint, {})
+                    c1, c2, c3 = st.columns([2, 2, 4])
+                    c1.markdown(f"**{item['candidate_id']}** | {float(item['score']):.1f}")
+                    c2.selectbox(
+                        "Decision", REVIEW_DECISIONS, key=f"dec_{fingerprint}", label_visibility="collapsed",
+                        index=REVIEW_DECISIONS.index(saved.get("decision", "Not reviewed")),
+                    )
+                    c3.text_input(
+                        "Reason", value=saved.get("reason", ""), key=f"why_{fingerprint}",
+                        label_visibility="collapsed", placeholder="Reason (job-related only)",
+                    )
+                submitted = st.form_submit_button("Save decisions", type="primary")
+
+            if submitted:
+                errors: List[str] = []
+                new_log = dict(state["review_log"])
+                for item in results:
+                    fingerprint = str(item["fingerprint"])[:12]
+                    decision = state.get(f"dec_{fingerprint}", "Not reviewed")
+                    reason = str(state.get(f"why_{fingerprint}", "")).strip()
+                    if decision == "Not reviewed":
+                        new_log.pop(fingerprint, None)
+                        continue
+                    problem = validate_review_entry(decision, reason)
+                    if problem:
+                        errors.append(f"{item['candidate_id']}: {problem}")
+                        continue
+                    new_log[fingerprint] = {
+                        "time": now_utc_text(), "candidate": item["candidate_id"], "score": float(item["score"]),
+                        "decision": decision, "reason": reason,
+                    }
+                state["review_log"] = new_log
+                for message in errors:
+                    st.markdown(note_html(message, "bad", "⛔"), unsafe_allow_html=True)
+                if not errors:
+                    st.markdown(note_html("Decisions saved.", "info", "✅"), unsafe_allow_html=True)
+
+            if state["review_log"]:
+                log_df = review_log_dataframe(state["review_log"])
+                st.markdown(section_html("Decision log"), unsafe_allow_html=True)
+                st.markdown(df_table_html(log_df, 100), unsafe_allow_html=True)
+                st.download_button(
+                    "⬇️ Download decision log (CSV)",
+                    data=dataframe_to_csv_bytes(log_df),
+                    file_name="fairhire_review_log.csv",
+                    mime="text/csv",
+                )
+
+            st.markdown(section_html("Audit report"), unsafe_allow_html=True)
+            st.caption(
+                "One file with the settings, ranking, explanations, proxy flags, fairness results (simulated results are labelled) "
+                "and your decisions. Open it in a browser and press Ctrl+P (Cmd+P on a Mac) to save it as a PDF."
+            )
+            sections = synthetic_fairness_sections(state["synthetic"])
+            if state["audit_report"]:
+                sections.append({"title": "Uploaded outcomes table", "report": state["audit_report"], "simulated": False})
+            report_html = build_report_html(
+                results, config, sections, list(state["review_log"].values()), show_files=bool(state["reveal_files"])
+            )
+            st.download_button(
+                "⬇️ Download audit report (HTML)",
+                data=report_html.encode("utf-8"),
+                file_name="fairhire_audit_report.html",
+                mime="text/html",
+            )
+            st.text_input("Report title", key="report_title", placeholder="e.g. Data Scientist screening, Oct 2026")
+            if st.button("💾 Save report to my dashboard", key="save_report_btn"):
+                saved_html = build_report_html(
+                    results, config, sections, list(state["review_log"].values()), show_files=False
+                )
+                summary = {
+                    "resumes": len(results),
+                    "top_score": round(float(results[0]["score"]), 1),
+                    "decisions": len(state["review_log"]),
+                }
+                _rid, problem = auth.save_report(conn, user["id"], state["report_title"], "screening", saved_html, summary)
+                state["flash"] = ("bad", problem) if problem else ("info", "Report saved to your dashboard.")
+                st.rerun()
+
+    # ------------------------------------------------------------------ Bias stress test tab
+    with tab_stress:
+        st.markdown(section_html("Bias stress test"), unsafe_allow_html=True)
+        st.markdown(
+            note_html(
+                "Each resume is re-scored with its name replaced by other names and its gendered words swapped. "
+                "A fair, identity-blind scorer should give the same score every time. This checks the scoring step only; "
+                "it does not prove the rest of the process is unbiased.",
+                "info",
+                "🧪",
+            ),
+            unsafe_allow_html=True,
+        )
+        if not results:
+            st.markdown(
+                empty_state_html("No resumes to test", "Run a screening first.", "🧪"), unsafe_allow_html=True
+            )
+        else:
+            st.checkbox("Test the raw text (ignore the anonymization setting)", key="stress_raw")
+            use_anonymize = bool(state["anonymize"]) and not state["stress_raw"]
+            tests = [
+                bias_stress_test(
+                    str(item["original_text"]), required, state["jd_text"], float(state["min_years"]),
+                    weights, bank, use_anonymize,
+                )
+                for item in results
+            ]
+            unchanged = sum(1 for t in tests if t["passed"])
+            worst = max(float(t["max_abs_delta"]) for t in tests)
+            st.markdown(
+                kpis_html(
+                    [
+                        kpi_card("Resumes tested", len(tests)),
+                        kpi_card("Scores unchanged", f"{unchanged} / {len(tests)}", "", "ok" if unchanged == len(tests) else "bad"),
+                        kpi_card("Largest change", f"{worst:.1f}", "points", "ok" if worst <= 0.05 else "bad"),
+                    ]
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(stress_summary_html(results, tests), unsafe_allow_html=True)
+            labels = [f"{item['candidate_id']} ({float(item['score']):.1f})" for item in results]
+            chosen = st.selectbox("See the variants for one candidate", labels, index=0)
+            st.markdown(stress_detail_html(tests[labels.index(chosen)]), unsafe_allow_html=True)
+
     # ------------------------------------------------------------------ Methodology tab
     with tab_method:
         st.markdown(METHODOLOGY_MD)
+
+    if tab_admin is not None:
+        with tab_admin:
+            render_admin(st, state, conn, user)
 
     st.markdown(
         '<div class="fh-footer">FairHire is decision support, not a decision maker. A human reviews every outcome.</div>',
