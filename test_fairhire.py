@@ -313,5 +313,73 @@ class SyntheticDataTests(unittest.TestCase):
         self.assertTrue((df["merit_score"] == df["biased_score"]).all())
 
 
+class UiComponentTests(unittest.TestCase):
+    def setUp(self):
+        self.results, _ = app.screen_resumes(
+            [("<script>alert(1)</script>.txt", "Python SQL. 5 years of experience. $100 & <b>bold</b>"), ("b.txt", "Python")],
+            ["python", "sql"], "", 2, anonymize=False,
+        )
+
+    def test_theme_css_differs_between_modes(self):
+        light, dark = app.theme_css(False), app.theme_css(True)
+        self.assertIn("color-scheme: light", light)
+        self.assertIn("color-scheme: dark", dark)
+        self.assertIn(app.THEMES["light"]["bg"], light)
+        self.assertIn(app.THEMES["dark"]["bg"], dark)
+        self.assertNotIn(app.THEMES["dark"]["bg"], light)
+        self.assertTrue(light.startswith("<style>") and light.endswith("</style>"))
+
+    def test_html_is_escaped(self):
+        table = app.results_table_html(self.results, 1, show_files=True)
+        card = app.candidate_card_html(self.results[0], show_files=True)
+        for html_out in (table, card):
+            self.assertNotIn("<script>", html_out)
+        self.assertIn("&lt;script&gt;", table)
+        self.assertNotIn("<b>bold</b>", card)
+        self.assertNotIn("$", card)
+
+    def test_no_blank_lines_that_break_markdown(self):
+        outputs = [
+            app.results_table_html(self.results, 1),
+            app.candidate_card_html(self.results[0], open_card=True),
+            app.hero_html(),
+            app.kpis_html([app.kpi_card("A", 1, "hint", "ok")]),
+            app.rates_bars_html({"A": 0.5, "B": 0.25}, {"A": 4, "B": 4}),
+            app.empty_state_html("t", "b"),
+            app.note_html("line1\n\nline2", "warn", "!"),
+        ]
+        for out in outputs:
+            self.assertNotIn("\n", out)
+
+    def test_candidate_card_open_attribute(self):
+        self.assertIn("<details class=\"fh-cand\" open>", app.candidate_card_html(self.results[0], open_card=True))
+        self.assertNotIn(" open>", app.candidate_card_html(self.results[0], open_card=False))
+
+    def test_fairness_panel_variants(self):
+        bad = app.fairness_report(["A"] * 20 + ["B"] * 20, [True] * 10 + [False] * 10 + [True] * 2 + [False] * 18)
+        good = app.fairness_report(["A", "A", "B", "B"], [True, False, True, False])
+        undefined = app.fairness_report(["A", "B"], [False, False])
+        single = app.fairness_report(["A", "A"], [True, False])
+        self.assertIn("Flag for review", app.fairness_panel_html("t", bad))
+        self.assertIn("Passes four-fifths guide", app.fairness_panel_html("t", good))
+        self.assertIn("Cannot assess", app.fairness_panel_html("t", undefined))
+        self.assertIn("Cannot assess", app.fairness_panel_html("t", single))
+
+    def test_score_tone_and_bar_bounds(self):
+        self.assertEqual([app.score_tone(x) for x in (0, 49.9, 50, 74.9, 75, 100)], ["bad", "bad", "warn", "warn", "ok", "ok"])
+        self.assertIn("width:100.0%", app._score_cell(250))
+        self.assertIn("width:0.0%", app._score_cell(-5))
+
+    def test_df_table_html(self):
+        import pandas as pd
+
+        df = pd.DataFrame({"a": ["<x>", "y"], "ok": [True, False], "v": [1.234, 2.0]})
+        out = app.df_table_html(df, max_rows=1)
+        self.assertIn("&lt;x&gt;", out)
+        self.assertIn("✓", out)
+        self.assertNotIn(">y<", out)
+        self.assertNotIn("\n", out)
+
+
 if __name__ == "__main__":
     unittest.main()
