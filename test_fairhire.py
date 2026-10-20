@@ -320,14 +320,23 @@ class UiComponentTests(unittest.TestCase):
             ["python", "sql"], "", 2, anonymize=False,
         )
 
-    def test_theme_css_differs_between_modes(self):
+    def test_theme_css_has_both_palettes_and_fallback(self):
         light, dark = app.theme_css(False), app.theme_css(True)
-        self.assertIn("color-scheme: light", light)
-        self.assertIn("color-scheme: dark", dark)
-        self.assertIn(app.THEMES["light"]["bg"], light)
-        self.assertIn(app.THEMES["dark"]["bg"], dark)
-        self.assertNotIn(app.THEMES["dark"]["bg"], light)
-        self.assertTrue(light.startswith("<style>") and light.endswith("</style>"))
+        for css in (light, dark):
+            self.assertTrue(css.startswith("<style>") and css.endswith("</style>"))
+            self.assertNotIn("\n", css)
+            self.assertIn(":root:has(.fh-dark-marker)", css)
+            self.assertIn(":root:not(:has(.fh-dark-marker))", css)
+            self.assertIn(app.THEMES["light"]["bg"], css)
+            self.assertIn(app.THEMES["dark"]["bg"], css)
+        # the plain :root fallback block (first --bg occurrence) follows the requested mode
+        self.assertTrue(light.split("--bg: ", 1)[1].startswith(app.THEMES["light"]["bg"]))
+        self.assertTrue(dark.split("--bg: ", 1)[1].startswith(app.THEMES["dark"]["bg"]))
+
+    def test_theme_marker(self):
+        self.assertIn("fh-dark-marker", app.theme_marker_html(True))
+        self.assertNotIn("fh-dark-marker", app.theme_marker_html(False))
+        self.assertNotIn("\n", app.theme_marker_html(True))
 
     def test_html_is_escaped(self):
         table = app.results_table_html(self.results, 1, show_files=True)
