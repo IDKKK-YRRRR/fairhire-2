@@ -350,6 +350,14 @@ class UiComponentTests(unittest.TestCase):
         self.assertIn("Light", app.theme_label_html(False))
         self.assertIn('data-fh-theme="dark"', app.theme_css(False))
 
+    def test_content_clears_streamlit_fixed_header(self):
+        # Streamlit's header is fixed at the top; too little top padding puts the
+        # dark-mode toggle underneath it, where clicks never reach the toggle.
+        import re
+
+        for rule in re.findall(r"\.block-container \{[^}]*padding: ([\d.]+)rem", app.BASE_CSS):
+            self.assertGreaterEqual(float(rule), 4.0)
+
     def test_html_is_escaped(self):
         table = app.results_table_html(self.results, 1, show_files=True)
         card = app.candidate_card_html(self.results[0], show_files=True)
