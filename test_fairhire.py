@@ -338,6 +338,18 @@ class UiComponentTests(unittest.TestCase):
         self.assertNotIn("fh-dark-marker", app.theme_marker_html(False))
         self.assertNotIn("\n", app.theme_marker_html(True))
 
+    def test_theme_script_and_label(self):
+        for dark in (False, True):
+            script = app.theme_script_html(dark)
+            self.assertTrue(script.startswith("<script>") and script.endswith("</script>"))
+            self.assertEqual(script.count("</script>"), 1)
+            self.assertIn("window.parent.document", script)
+            self.assertIn(f"'data-fh-theme','{'dark' if dark else 'light'}'", script)
+            self.assertIn(app.THEMES["dark"]["bg"], script)
+        self.assertIn("Dark", app.theme_label_html(True))
+        self.assertIn("Light", app.theme_label_html(False))
+        self.assertIn('data-fh-theme="dark"', app.theme_css(False))
+
     def test_html_is_escaped(self):
         table = app.results_table_html(self.results, 1, show_files=True)
         card = app.candidate_card_html(self.results[0], show_files=True)
