@@ -358,6 +358,19 @@ class UiComponentTests(unittest.TestCase):
         for rule in re.findall(r"\.block-container \{[^}]*padding: ([\d.]+)rem", app.BASE_CSS):
             self.assertGreaterEqual(float(rule), 4.0)
 
+    def test_intro_is_calm_and_never_blocks_clicks(self):
+        import re
+
+        html_out = app.intro_html()
+        self.assertIn("Welcome to FairHire", html_out)
+        self.assertNotIn("\n", html_out)
+        self.assertNotIn("<script", html_out)
+        rule = re.search(r"\.fh-intro \{([^}]*)\}", app.BASE_CSS).group(1)
+        self.assertIn("pointer-events: none", rule)
+        self.assertIn("forwards", rule)  # stays hidden after fading out
+        self.assertIn("visibility: hidden", app.BASE_CSS)
+        self.assertIn("prefers-reduced-motion", app.BASE_CSS)
+
     def test_html_is_escaped(self):
         table = app.results_table_html(self.results, 1, show_files=True)
         card = app.candidate_card_html(self.results[0], show_files=True)
