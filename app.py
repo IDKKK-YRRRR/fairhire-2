@@ -935,20 +935,21 @@ hr {border-color: var(--border) !important;}
 .fh-theme-marker {display: none;}
 .fh-theme-label {font-size: .75rem; color: var(--muted); text-align: right; margin-top: -.4rem;}
 .fh-intro {position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 1000001; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  text-align: center; padding: 2rem; pointer-events: none; animation: fh-intro-life 5.4s ease forwards;
+  text-align: center; padding: 2rem; pointer-events: none; animation: fh-intro-life 9s ease forwards;
   background: radial-gradient(900px 520px at 15% 10%, rgba(124,58,237,.20), transparent), radial-gradient(900px 520px at 88% 92%, rgba(56,189,248,.18), transparent), var(--bg);}
-@keyframes fh-intro-life {0% {opacity: 0; visibility: visible;} 15% {opacity: 1;} 78% {opacity: 1;} 99% {opacity: 0; visibility: visible;} 100% {opacity: 0; visibility: hidden;}}
+@keyframes fh-intro-life {0% {opacity: 0; visibility: visible;} 10% {opacity: 1;} 86% {opacity: 1;} 99% {opacity: 0; visibility: visible;} 100% {opacity: 0; visibility: hidden;}}
 @keyframes fh-intro-rise {0% {opacity: 0; transform: translateY(14px);} 100% {opacity: 1; transform: translateY(0);}}
 @keyframes fh-breathe {0%, 100% {transform: scale(1); box-shadow: 0 0 0 0 rgba(129,140,248,.35);} 50% {transform: scale(1.07); box-shadow: 0 0 0 22px rgba(129,140,248,0);}}
 @keyframes fh-dot {0%, 80%, 100% {opacity: .25; transform: scale(.8);} 40% {opacity: 1; transform: scale(1);}}
 .fh-intro-logo {width: 92px; height: 92px; border-radius: 28px; display: flex; align-items: center; justify-content: center; font-size: 2.6rem; color: #fff;
   background: linear-gradient(135deg, var(--primary), var(--primary2)); animation: fh-breathe 3s ease-in-out infinite, fh-intro-rise 1.1s ease both;}
-.fh-intro-title {margin-top: 1.4rem; font-size: 2.1rem; font-weight: 800; letter-spacing: -.02em; color: var(--text); animation: fh-intro-rise 1.2s ease .35s both;}
-.fh-intro-sub {margin-top: .5rem; max-width: 30rem; font-size: 1.02rem; line-height: 1.55; color: var(--muted); animation: fh-intro-rise 1.2s ease .7s both;}
-.fh-intro-dots {margin-top: 1.6rem; display: flex; gap: .45rem; animation: fh-intro-rise 1.2s ease 1s both;}
+.fh-intro-title {margin-top: 1.4rem; font-size: 2.1rem; font-weight: 800; letter-spacing: -.02em; color: var(--text); animation: fh-intro-rise 1.4s ease .5s both;}
+.fh-intro-sub {margin-top: .5rem; max-width: 30rem; font-size: 1.02rem; line-height: 1.55; color: var(--muted); animation: fh-intro-rise 1.4s ease 1.3s both;}
+.fh-intro-steps {margin-top: .9rem; font-size: .9rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--primary); animation: fh-intro-rise 1.4s ease 2.6s both;}
+.fh-intro-dots {margin-top: 1.6rem; display: flex; gap: .45rem; animation: fh-intro-rise 1.4s ease 3.6s both;}
 .fh-intro-dots span {width: 9px; height: 9px; border-radius: 50%; background: var(--primary); animation: fh-dot 1.4s ease-in-out infinite;}
 .fh-intro-dots span:nth-child(2) {animation-delay: .2s;} .fh-intro-dots span:nth-child(3) {animation-delay: .4s;}
-@media (prefers-reduced-motion: reduce) {.fh-intro, .fh-intro * {animation-duration: 3.2s !important; animation-iteration-count: 1 !important;} .fh-intro-logo, .fh-intro-dots span {animation-name: none !important;}}
+@media (prefers-reduced-motion: reduce) {.fh-intro, .fh-intro * {animation-duration: 5s !important; animation-iteration-count: 1 !important;} .fh-intro-logo, .fh-intro-dots span {animation-name: none !important;}}
 .fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
 @media (max-width: 720px) {.block-container {padding: 4.2rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
@@ -1054,6 +1055,7 @@ def intro_html() -> str:
         '<div class="fh-intro-title">Welcome to FairHire</div>'
         '<div class="fh-intro-sub">Fair, clear and explainable hiring. '
         "Take a deep breath, we&#39;ll handle the heavy lifting together.</div>"
+        '<div class="fh-intro-steps">Anonymize · Score · Audit</div>'
         '<div class="fh-intro-dots"><span></span><span></span><span></span></div></div>'
     )
 
