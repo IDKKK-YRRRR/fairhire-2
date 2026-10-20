@@ -7,13 +7,14 @@ Explainable AI resume screening with a built-in fairness audit, built with Strea
 
 ## Features
 
+- Modern, responsive interface with a **light / dark mode toggle** (top right)
 - Upload resumes as **TXT, PDF or DOCX** (max 5 MB each) with clear error messages for unreadable files
 - Job description + required-skill configuration, minimum years of experience, shortlist size
 - Deterministic score from **0 to 100** with matched skills, missing skills and written reasons
 - Best-effort **anonymization** (names, emails, phones, links, address/DOB/personal-detail lines, gendered words)
 - **Fairness audit**: selection rates, demographic parity difference, disparate impact ratio (four-fifths rule of thumb)
 - **Synthetic data** simulation, plus optional audit of your own outcomes CSV
-- Ranking table and **CSV export**
+- Color-coded ranking table, per-candidate score breakdown cards, and **CSV export**
 - Methodology and limitations tab
 
 No API keys, paid services, Docker or environment variables are needed.
