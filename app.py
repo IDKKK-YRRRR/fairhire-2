@@ -15,6 +15,7 @@ Design notes
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import io
 import random
 import re
@@ -757,7 +758,7 @@ def audit_uploaded_outcomes(df: pd.DataFrame, group_col: str, selected_col: str)
 
 
 # --------------------------------------------------------------------------------------
-# Streamlit interface
+# Methodology text
 # --------------------------------------------------------------------------------------
 
 METHODOLOGY_MD = """
@@ -799,32 +800,389 @@ both groups. The "biased process" is a simulated reviewer penalty added only to 
   law, obtain consent for processing resumes, and audit with real outcome data and statistical tests before relying on it.
 """
 
+# --------------------------------------------------------------------------------------
+# UI components (pure functions that return HTML strings; easy to test, no Streamlit needed)
+# --------------------------------------------------------------------------------------
+
+THEMES: Dict[str, Dict[str, str]] = {
+    "light": {
+        "bg": "#F4F6FB", "surface": "#FFFFFF", "surface2": "#F1F4FA", "border": "#E2E8F0",
+        "text": "#0F172A", "muted": "#64748B", "primary": "#4F46E5", "primary2": "#7C3AED",
+        "primary_soft": "#EEF2FF", "ok": "#059669", "ok_soft": "#D1FAE5", "warn": "#B45309",
+        "warn_soft": "#FEF3C7", "bad": "#DC2626", "bad_soft": "#FEE2E2",
+        "shadow": "0 1px 2px rgba(15,23,42,.06), 0 8px 24px rgba(15,23,42,.06)",
+        "hero_a": "#312E81", "hero_b": "#6D28D9", "scheme": "light",
+    },
+    "dark": {
+        "bg": "#0B1020", "surface": "#121A30", "surface2": "#1A2440", "border": "#26335A",
+        "text": "#E6E9F5", "muted": "#9AA7C7", "primary": "#818CF8", "primary2": "#A78BFA",
+        "primary_soft": "#232C5A", "ok": "#34D399", "ok_soft": "#0F3D33", "warn": "#FBBF24",
+        "warn_soft": "#43360F", "bad": "#F87171", "bad_soft": "#4A1D24",
+        "shadow": "0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35)",
+        "hero_a": "#1E1B4B", "hero_b": "#4C1D95", "scheme": "dark",
+    },
+}
+
+BASE_CSS = """
+html, body, .stApp, button, input, textarea, select {font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {background: var(--bg) !important; color: var(--text);}
+[data-testid="stHeader"] {background: transparent !important;}
+[data-testid="stHeader"] * {color: var(--muted);}
+#MainMenu, footer {visibility: hidden;}
+.block-container {max-width: 1280px; padding: 1.25rem 1.5rem 3rem;}
+h1, h2, h3, h4, h5, h6, label, [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stWidgetLabel"] p {color: var(--text) !important;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {color: var(--muted) !important;}
+.stTextInput input, .stTextArea textarea, .stNumberInput input, [data-baseweb="input"], [data-baseweb="base-input"],
+[data-baseweb="textarea"], [data-baseweb="select"] > div {background: var(--surface2) !important; color: var(--text) !important;
+  border-color: var(--border) !important; border-radius: 10px !important;}
+.stTextArea textarea::placeholder, .stTextInput input::placeholder {color: var(--muted) !important; opacity: .8;}
+[data-baseweb="select"] svg, [data-testid="stNumberInput"] button svg {fill: var(--muted); color: var(--muted);}
+[data-testid="stNumberInput"] button {background: var(--surface2) !important; border-color: var(--border) !important;}
+[data-baseweb="tag"] {background: var(--primary_soft) !important; color: var(--primary) !important; border-radius: 8px !important;}
+[data-baseweb="tag"] span, [data-baseweb="tag"] svg {color: var(--primary) !important; fill: var(--primary) !important;}
+[data-baseweb="popover"] > div, [data-baseweb="menu"], [data-baseweb="popover"] ul {background: var(--surface) !important; color: var(--text) !important;
+  border: 1px solid var(--border); border-radius: 10px;}
+[data-baseweb="popover"] li, [data-baseweb="menu"] li {background: var(--surface) !important; color: var(--text) !important;}
+[data-baseweb="popover"] li:hover, [data-baseweb="menu"] li:hover {background: var(--primary_soft) !important;}
+[data-testid="stFileUploaderDropzone"] {background: var(--surface2) !important; border: 1.5px dashed var(--border) !important; border-radius: 12px !important;}
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploader"] small {color: var(--muted) !important;}
+[data-testid="stFileUploaderDropzone"] button {background: var(--surface) !important; color: var(--text) !important; border: 1px solid var(--border) !important;}
+[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] * {color: var(--text) !important;}
+.stButton > button, .stDownloadButton > button {border-radius: 10px; font-weight: 600; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); transition: transform .08s ease, box-shadow .15s ease;}
+.stButton > button:hover, .stDownloadButton > button:hover {border-color: var(--primary); color: var(--primary); transform: translateY(-1px);}
+.stButton > button[kind="primary"] {background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #fff; border: 0;
+  box-shadow: 0 6px 18px rgba(79,70,229,.35);}
+.stButton > button[kind="primary"]:hover {color: #fff; box-shadow: 0 8px 22px rgba(79,70,229,.5);}
+[data-testid="stCheckbox"] label span, [data-testid="stToggle"] label span {color: var(--text) !important;}
+.stTabs [data-baseweb="tab-list"] {gap: .25rem; border-bottom: 1px solid var(--border); background: transparent;}
+.stTabs button[data-baseweb="tab"] {background: transparent !important; color: var(--muted) !important; font-weight: 600; padding: .6rem 1rem;}
+.stTabs button[data-baseweb="tab"][aria-selected="true"] {color: var(--primary) !important;}
+.stTabs [data-baseweb="tab-highlight"] {background: var(--primary) !important; height: 3px; border-radius: 3px;}
+.stTabs [data-baseweb="tab-border"] {background: transparent !important;}
+[data-testid="stSlider"] [role="slider"] {background: var(--primary) !important; box-shadow: none;}
+[data-testid="stSlider"] [data-testid="stThumbValue"], [data-testid="stSliderThumbValue"],
+[data-testid="stTickBarMin"], [data-testid="stTickBarMax"] {color: var(--muted) !important;}
+[data-testid="stColumn"]:has(.fh-card-marker), [data-testid="column"]:has(.fh-card-marker) {background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; padding: 1.25rem 1.25rem 1rem; box-shadow: var(--shadow);}
+hr {border-color: var(--border) !important;}
+
+.fh-hero {display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; padding: 1.4rem 1.6rem;
+  border-radius: 18px; color: #fff; background: radial-gradient(1200px 300px at 90% -20%, rgba(255,255,255,.18), transparent),
+  linear-gradient(120deg, var(--hero_a), var(--hero_b)); box-shadow: var(--shadow);}
+.fh-hero-main {display: flex; gap: 1rem; align-items: center;}
+.fh-logo {width: 52px; height: 52px; border-radius: 14px; background: rgba(255,255,255,.16); display: flex; align-items: center; justify-content: center; font-size: 1.7rem;}
+.fh-title {font-size: 1.8rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; color: #fff;}
+.fh-sub {opacity: .88; margin-top: .2rem; font-size: .98rem; color: #fff;}
+.fh-chips {display: flex; flex-wrap: wrap; gap: .4rem;}
+.fh-chips span {background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.25); padding: .3rem .7rem; border-radius: 999px; font-size: .78rem; font-weight: 600; color: #fff;}
+.fh-section {display: flex; align-items: center; gap: .6rem; font-weight: 700; font-size: 1.05rem; margin: .2rem 0 .6rem; color: var(--text);}
+.fh-step {width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #fff; font-size: .8rem;
+  display: inline-flex; align-items: center; justify-content: center;}
+.fh-kpis {display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .8rem; margin: .4rem 0 1rem;}
+.fh-kpi {background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: .9rem 1rem; box-shadow: var(--shadow);}
+.fh-kpi-label {font-size: .74rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700;}
+.fh-kpi-value {font-size: 1.7rem; font-weight: 800; color: var(--text); margin-top: .15rem; letter-spacing: -.02em;}
+.fh-kpi-hint {font-size: .78rem; color: var(--muted); margin-top: .1rem;}
+.fh-kpi.tone-ok .fh-kpi-value {color: var(--ok);} .fh-kpi.tone-bad .fh-kpi-value {color: var(--bad);} .fh-kpi.tone-warn .fh-kpi-value {color: var(--warn);}
+.fh-table-wrap {overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); margin-bottom: 1rem;}
+.fh-table {width: 100%; border-collapse: collapse; font-size: .9rem;}
+.fh-table th {text-align: left; padding: .7rem .9rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  background: var(--surface2); border-bottom: 1px solid var(--border); white-space: nowrap;}
+.fh-table td {padding: .7rem .9rem; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: middle;}
+.fh-table tr:last-child td {border-bottom: 0;}
+.fh-table tbody tr:hover td {background: var(--surface2);}
+.fh-rank {display: inline-flex; width: 28px; height: 28px; border-radius: 8px; align-items: center; justify-content: center; font-weight: 800; font-size: .85rem;
+  background: var(--primary_soft); color: var(--primary);}
+.fh-score {display: flex; align-items: center; gap: .6rem; min-width: 150px;}
+.fh-score b {min-width: 2.6rem; font-variant-numeric: tabular-nums;}
+.fh-bar {flex: 1; height: 8px; border-radius: 999px; background: var(--surface2); overflow: hidden; border: 1px solid var(--border);}
+.fh-bar i {display: block; height: 100%; border-radius: 999px;}
+.fh-chip {display: inline-block; padding: .15rem .55rem; margin: .12rem .2rem .12rem 0; border-radius: 999px; font-size: .74rem; font-weight: 600; white-space: nowrap;}
+.fh-chip.ok {background: var(--ok_soft); color: var(--ok);} .fh-chip.bad {background: var(--bad_soft); color: var(--bad);}
+.fh-chip.neutral {background: var(--surface2); color: var(--muted); border: 1px solid var(--border);}
+.fh-pill {display: inline-block; padding: .2rem .65rem; border-radius: 999px; font-size: .75rem; font-weight: 700;}
+.fh-pill.ok {background: var(--ok_soft); color: var(--ok);} .fh-pill.bad {background: var(--bad_soft); color: var(--bad);}
+.fh-pill.warn {background: var(--warn_soft); color: var(--warn);} .fh-pill.neutral {background: var(--surface2); color: var(--muted);}
+.fh-muted {color: var(--muted);}
+.fh-note {display: flex; gap: .7rem; padding: .8rem 1rem; border-radius: 12px; margin: .4rem 0 .8rem; font-size: .9rem; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text);}
+.fh-note.warn {background: var(--warn_soft); border-color: transparent; color: var(--warn);} .fh-note.bad {background: var(--bad_soft); border-color: transparent; color: var(--bad);}
+.fh-note.info {background: var(--primary_soft); border-color: transparent; color: var(--primary);}
+.fh-empty {text-align: center; padding: 2.5rem 1rem; border: 1.5px dashed var(--border); border-radius: 16px; background: var(--surface); color: var(--muted);}
+.fh-empty .big {font-size: 2.2rem;} .fh-empty b {color: var(--text); display: block; margin: .4rem 0 .2rem; font-size: 1.05rem;}
+.fh-cand {background: var(--surface); border: 1px solid var(--border); border-radius: 14px; margin-bottom: .6rem; box-shadow: var(--shadow); overflow: hidden;}
+.fh-cand summary {cursor: pointer; list-style: none; display: flex; align-items: center; gap: .7rem; padding: .8rem 1rem; font-weight: 600; color: var(--text);}
+.fh-cand summary::-webkit-details-marker {display: none;}
+.fh-cand summary .grow {flex: 1;}
+.fh-cand-body {padding: .2rem 1rem 1rem; border-top: 1px solid var(--border); color: var(--text);}
+.fh-cand-body h5 {margin: .9rem 0 .3rem; font-size: .74rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted) !important;}
+.fh-stack {display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: var(--surface2); border: 1px solid var(--border);}
+.fh-stack i {display: block; height: 100%;}
+.fh-legend {display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .4rem; font-size: .8rem; color: var(--muted);}
+.fh-dot {display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: .35rem;}
+.fh-cand ul {margin: .2rem 0 0 1.1rem; padding: 0;} .fh-cand li {margin: .15rem 0; color: var(--text);}
+.fh-cand details.fh-raw summary {padding: .5rem 0 0; font-size: .82rem; color: var(--primary); font-weight: 600;}
+.fh-cand pre {white-space: pre-wrap; background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: .8rem; font-size: .8rem;
+  max-height: 260px; overflow: auto; color: var(--text); margin-top: .5rem;}
+.fh-panel {background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 1.1rem 1.2rem; box-shadow: var(--shadow); height: 100%;}
+.fh-panel-title {font-weight: 700; margin-bottom: .8rem; color: var(--text);}
+.fh-rate {margin: .5rem 0;} .fh-rate-head {display: flex; justify-content: space-between; font-size: .85rem; margin-bottom: .25rem; color: var(--text);}
+.fh-rate-head span:last-child {color: var(--muted); font-variant-numeric: tabular-nums;}
+.fh-rate .fh-bar {height: 12px;}
+.fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
+@media (max-width: 720px) {.block-container {padding: .8rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
+"""
+
+
+def theme_css(dark: bool) -> str:
+    """Return a <style> block for the light or dark theme."""
+    palette = THEMES["dark" if dark else "light"]
+    variables = "".join(f"--{key}: {value};" for key, value in palette.items() if key != "scheme")
+    return (
+        "<style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');"
+        f":root {{{variables} color-scheme: {palette['scheme']};}}"
+        + BASE_CSS
+        + "</style>"
+    )
+
+
+def _esc(value: object) -> str:
+    """Escape text for safe use inside HTML that is passed through Markdown."""
+    text = "" if value is None else str(value)
+    return (
+        _html.escape(text, quote=True).replace("$", "&#36;").replace("\r", "").replace("\n", "&#10;")
+    )
+
+
+def score_tone(score: float) -> str:
+    if score >= 75:
+        return "ok"
+    if score >= 50:
+        return "warn"
+    return "bad"
+
+
+_TONE_COLOR = {"ok": "var(--ok)", "warn": "var(--warn)", "bad": "var(--bad)", "neutral": "var(--muted)"}
+_BAR_GRADIENTS = [
+    "linear-gradient(90deg, var(--primary), var(--primary2))",
+    "linear-gradient(90deg, #0EA5E9, #22D3EE)",
+    "linear-gradient(90deg, #F59E0B, #F97316)",
+    "linear-gradient(90deg, #10B981, #34D399)",
+]
+
+
+def hero_html() -> str:
+    return (
+        '<div class="fh-hero"><div class="fh-hero-main"><div class="fh-logo">⚖️</div><div>'
+        '<div class="fh-title">FairHire</div>'
+        '<div class="fh-sub">Explainable resume screening with a built-in fairness audit</div></div></div>'
+        '<div class="fh-chips"><span>Explainable scores</span><span>Anonymized review</span>'
+        "<span>Fairness audit</span></div></div>"
+    )
+
+
+def section_html(title: str, step: Optional[int] = None) -> str:
+    badge = f'<span class="fh-step">{int(step)}</span>' if step is not None else ""
+    return f'<div class="fh-section">{badge}{_esc(title)}</div>'
+
+
+def note_html(text: str, tone: str = "neutral", icon: str = "") -> str:
+    tone = tone if tone in ("warn", "bad", "info", "neutral") else "neutral"
+    icon_html = f"<span>{_esc(icon)}</span>" if icon else ""
+    return f'<div class="fh-note {tone}">{icon_html}<div>{_esc(text)}</div></div>'
+
+
+def empty_state_html(title: str, body: str, icon: str = "📄") -> str:
+    return (
+        f'<div class="fh-empty"><div class="big">{_esc(icon)}</div><b>{_esc(title)}</b>'
+        f"<div>{_esc(body)}</div></div>"
+    )
+
+
+def kpi_card(label: str, value: object, hint: str = "", tone: str = "neutral") -> str:
+    tone = tone if tone in ("ok", "warn", "bad") else "neutral"
+    hint_html = f'<div class="fh-kpi-hint">{_esc(hint)}</div>' if hint else ""
+    return (
+        f'<div class="fh-kpi tone-{tone}"><div class="fh-kpi-label">{_esc(label)}</div>'
+        f'<div class="fh-kpi-value">{_esc(value)}</div>{hint_html}</div>'
+    )
+
+
+def kpis_html(cards: Sequence[str]) -> str:
+    return '<div class="fh-kpis">' + "".join(cards) + "</div>"
+
+
+def pill_html(text: str, tone: str = "neutral") -> str:
+    tone = tone if tone in ("ok", "warn", "bad") else "neutral"
+    return f'<span class="fh-pill {tone}">{_esc(text)}</span>'
+
+
+def chips_html(items: Sequence[str], tone: str = "neutral", limit: Optional[int] = None) -> str:
+    items = list(items)
+    if not items:
+        return '<span class="fh-muted">None</span>'
+    shown = items if limit is None else items[:limit]
+    out = "".join(f'<span class="fh-chip {tone}">{_esc(i)}</span>' for i in shown)
+    if limit is not None and len(items) > limit:
+        out += f'<span class="fh-chip neutral">+{len(items) - limit}</span>'
+    return out
+
+
+def _score_cell(score: float) -> str:
+    value = clamp(float(score))
+    return (
+        f'<div class="fh-score"><b>{value:.1f}</b><div class="fh-bar"><i style="width:{value:.1f}%;'
+        f'background:{_TONE_COLOR[score_tone(value)]}"></i></div></div>'
+    )
+
+
+def results_table_html(results: Sequence[Dict[str, object]], top_n: int, show_files: bool = False) -> str:
+    head = ["Rank", "Candidate", "Score", "Years", "Matched skills", "Missing skills", "Shortlist"]
+    rows = []
+    for r in results:
+        name = _esc(r["candidate_id"])
+        if show_files:
+            name += f'<div class="fh-muted" style="font-size:.75rem">{_esc(r["file_name"])}</div>'
+        shortlisted = int(r["rank"]) <= top_n
+        rows.append(
+            "<tr>"
+            f'<td><span class="fh-rank">{int(r["rank"])}</span></td>'
+            f"<td><b>{name}</b></td>"
+            f"<td>{_score_cell(float(r['score']))}</td>"
+            f"<td>{float(r['years_experience']):g}</td>"
+            f"<td>{chips_html(r['matched_skills'], 'ok', 6)}</td>"
+            f"<td>{chips_html(r['missing_skills'], 'bad', 6)}</td>"
+            f"<td>{pill_html('Shortlisted', 'ok') if shortlisted else pill_html('-', 'neutral')}</td>"
+            "</tr>"
+        )
+    header = "".join(f"<th>{h}</th>" for h in head)
+    return (
+        '<div class="fh-table-wrap"><table class="fh-table"><thead><tr>'
+        + header
+        + "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+def candidate_card_html(item: Dict[str, object], show_files: bool = False, open_card: bool = False) -> str:
+    score = clamp(float(item["score"]))
+    label = _esc(item["candidate_id"])
+    if show_files:
+        label += f' <span class="fh-muted" style="font-weight:500">({_esc(item["file_name"])})</span>'
+    parts = [
+        ("Required skills", float(item["skill_points"]), "var(--primary)"),
+        ("Experience", float(item["experience_points"]), "#0EA5E9"),
+        ("Keywords", float(item["keyword_points"]), "#F59E0B"),
+    ]
+    stack = "".join(
+        f'<i style="width:{clamp(p):.1f}%;background:{color}"></i>' for _, p, color in parts
+    )
+    legend = "".join(
+        f'<span><span class="fh-dot" style="background:{color}"></span>{_esc(name)} {p:.1f} pts</span>'
+        for name, p, color in parts
+    )
+    reasons = "".join(f"<li>{_esc(r)}</li>" for r in item["reasons"]) or '<li class="fh-muted">No details.</li>'
+    raw = _esc(str(item.get("text_used", ""))[:3000])
+    return (
+        f'<details class="fh-cand"{" open" if open_card else ""}><summary>'
+        f'<span class="fh-rank">{int(item["rank"])}</span><span class="grow">{label}</span>'
+        f'{pill_html(f"{score:.1f} / 100", score_tone(score))}</summary><div class="fh-cand-body">'
+        f'<h5>Score breakdown</h5><div class="fh-stack">{stack}</div><div class="fh-legend">{legend}</div>'
+        f'<h5>Matched skills</h5>{chips_html(item["matched_skills"], "ok")}'
+        f'<h5>Missing skills</h5>{chips_html(item["missing_skills"], "bad")}'
+        f'<h5>Other skills detected</h5>{chips_html(item["extra_skills"], "neutral")}'
+        f'<h5>Detected experience</h5><div>{float(item["years_experience"]):g} years</div>'
+        f"<h5>Why this score</h5><ul>{reasons}</ul>"
+        f'<details class="fh-raw"><summary>View text used for scoring</summary><pre>{raw}</pre></details>'
+        "</div></details>"
+    )
+
+
+def rates_bars_html(rates: Dict[str, float], counts: Optional[Dict[str, int]] = None) -> str:
+    rows = []
+    for index, group in enumerate(sorted(rates)):
+        rate = clamp(rates[group] * 100.0)
+        n = f" (n={counts[group]})" if counts and group in counts else ""
+        rows.append(
+            f'<div class="fh-rate"><div class="fh-rate-head"><span>{_esc(group)}</span>'
+            f"<span>{rate:.1f}%{_esc(n)}</span></div>"
+            f'<div class="fh-bar"><i style="width:{rate:.1f}%;background:{_BAR_GRADIENTS[index % len(_BAR_GRADIENTS)]}"></i></div></div>'
+        )
+    return "".join(rows) or '<span class="fh-muted">No data.</span>'
+
+
+def fairness_panel_html(title: str, report: Dict[str, object]) -> str:
+    ratio = report["disparate_impact_ratio"]
+    dpd = float(report["demographic_parity_difference"])
+    if ratio is None:
+        ratio_card = kpi_card("Disparate impact ratio", "n/a", "undefined for this data")
+        status = pill_html("Cannot assess", "neutral")
+    elif ratio >= 0.8:
+        ratio_card = kpi_card("Disparate impact ratio", f"{ratio:.2f}", "at or above the 0.80 guide", "ok")
+        status = pill_html("Passes four-fifths guide", "ok")
+    else:
+        ratio_card = kpi_card("Disparate impact ratio", f"{ratio:.2f}", "below the 0.80 guide", "bad")
+        status = pill_html("Flag for review", "bad")
+    notes = "".join(f'<div class="fh-muted" style="font-size:.8rem;margin-top:.3rem">{_esc(n)}</div>' for n in report["notes"])
+    return (
+        f'<div class="fh-panel"><div class="fh-panel-title">{_esc(title)}</div>'
+        f'{rates_bars_html(report["rates"], report["counts"])}'
+        + kpis_html([kpi_card("Parity difference", f"{dpd:.3f}", "0 means equal rates"), ratio_card])
+        + f"<div>{status}</div>{notes}</div>"
+    )
+
+
+def df_table_html(df: pd.DataFrame, max_rows: int = 50) -> str:
+    """Render a DataFrame as a theme-aware HTML table (first ``max_rows`` rows)."""
+    shown = df.head(max_rows)
+    head = "".join(f"<th>{_esc(c)}</th>" for c in shown.columns)
+    body = []
+    for _, row in shown.iterrows():
+        cells = []
+        for value in row:
+            if pd.api.types.is_bool(value):
+                text = "✓" if value else "–"
+            elif isinstance(value, float):
+                text = f"{value:.1f}"
+            else:
+                text = str(value)
+            cells.append(f"<td>{_esc(text)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        '<div class="fh-table-wrap" style="max-height:420px;overflow:auto"><table class="fh-table"><thead><tr>'
+        + head
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Streamlit interface
+# --------------------------------------------------------------------------------------
+
 
 def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     import streamlit as st
 
     st.set_page_config(page_title="FairHire", page_icon="⚖️", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .block-container {padding-top: 1.5rem; max-width: 1400px;}
-        .fh-hero {padding: 1rem 1.25rem; border-radius: 12px;
-                  background: linear-gradient(90deg, #1f3a5f, #3b6ea8); color: #fff; margin-bottom: 1rem;}
-        .fh-hero h1 {margin: 0; font-size: 1.8rem;}
-        .fh-hero p {margin: 0.2rem 0 0 0; opacity: 0.9;}
-        </style>
-        <div class="fh-hero">
-          <h1>⚖️ FairHire</h1>
-          <p>Explainable resume screening with a built-in fairness audit. Decision support only - a human decides.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     state = st.session_state
     state.setdefault("results", [])
     state.setdefault("warnings", [])
+    state.setdefault("notice", "")
     state.setdefault("synthetic", None)
+    state.setdefault("dark_mode", False)
+
+    top_left, top_right = st.columns([6, 1.3])
+    with top_right:
+        st.toggle("🌙 Dark mode", key="dark_mode")
+    dark = bool(state.get("dark_mode"))
+    st.markdown(theme_css(dark), unsafe_allow_html=True)
+    with top_left:
+        st.markdown(hero_html(), unsafe_allow_html=True)
 
     tab_screen, tab_audit, tab_method = st.tabs(["📄 Screening", "📊 Fairness audit", "📘 Methodology"])
 
@@ -833,27 +1191,29 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         left, right = st.columns([1, 2], gap="large")
 
         with left:
-            st.subheader("1. Job setup")
+            st.markdown('<div class="fh-card-marker"></div>' + section_html("Job setup", 1), unsafe_allow_html=True)
             use_sample = st.checkbox("Use sample job description and resumes (demo)", value=False)
             jd_text = st.text_area(
                 "Job description",
                 value=SAMPLE_JOB_DESCRIPTION if use_sample else "",
-                height=170,
+                height=160,
                 placeholder="Paste the job description here...",
             )
-            skill_options = sorted(SKILL_BANK.keys())
             required_selected = st.multiselect(
                 "Required skills",
-                options=skill_options,
+                options=sorted(SKILL_BANK.keys()),
                 default=DEFAULT_REQUIRED_SKILLS if use_sample else [],
             )
             custom_skills_text = st.text_input("Extra required skills (comma-separated)", value="")
-            min_years = st.number_input("Minimum years of experience", min_value=0.0, max_value=40.0, value=2.0 if use_sample else 0.0, step=0.5)
-            shortlist_size = st.number_input("Shortlist size", min_value=1, max_value=500, value=3, step=1)
+            n1, n2 = st.columns(2)
+            min_years = n1.number_input(
+                "Min. years", min_value=0.0, max_value=40.0, value=2.0 if use_sample else 0.0, step=0.5
+            )
+            shortlist_size = n2.number_input("Shortlist size", min_value=1, max_value=500, value=3, step=1)
             anonymize = st.checkbox("Anonymize resumes before scoring", value=True)
-            reveal_files = st.checkbox("Show file names in results and export", value=False)
+            reveal_files = st.checkbox("Show file names in results", value=False)
 
-            st.subheader("2. Upload resumes")
+            st.markdown(section_html("Upload resumes", 2), unsafe_allow_html=True)
             files = st.file_uploader(
                 "TXT, PDF or DOCX (max 5 MB each)",
                 type=["txt", "pdf", "docx"],
@@ -874,7 +1234,9 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 documents.extend(SAMPLE_RESUMES.items())
 
             custom = [s.strip() for s in custom_skills_text.split(",") if s.strip()]
-            required = _dedupe_keep_order(canonical_skill(s) for s in list(required_selected) + custom)
+            required = _dedupe_keep_order(
+                s for s in (canonical_skill(x) for x in list(required_selected) + custom) if s
+            )
 
             if not documents:
                 state["results"] = []
@@ -887,78 +1249,82 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 state["notice"] = ""
                 state["config"] = {
                     "required": required,
-                    "anonymize": anonymize,
-                    "shortlist": int(shortlist_size),
-                    "reveal": reveal_files,
                     "jd_given": bool(jd_text.strip()),
                     "min_years": float(min_years),
                 }
 
         with right:
-            st.subheader("Results")
-            if state.get("notice"):
-                st.info(state["notice"])
+            st.markdown(section_html("Results"), unsafe_allow_html=True)
+            if state["notice"]:
+                st.markdown(note_html(state["notice"], "info", "ℹ️"), unsafe_allow_html=True)
             for message in state["warnings"]:
-                st.warning(message)
+                st.markdown(note_html(message, "warn", "⚠️"), unsafe_allow_html=True)
 
             results = state["results"]
             if not results:
-                st.caption("Configure the job on the left, upload resumes, then press **Run screening**.")
+                st.markdown(
+                    empty_state_html(
+                        "No results yet",
+                        "Set up the job on the left, upload resumes, then press Run screening.",
+                    ),
+                    unsafe_allow_html=True,
+                )
             else:
                 config = state.get("config", {})
-                show_files = bool(reveal_files)
                 if not config.get("required") and not config.get("jd_given") and config.get("min_years", 0) <= 0:
-                    st.error("Nothing to score against. Add required skills, a job description or minimum years.")
+                    st.markdown(
+                        note_html("Nothing to score against. Add required skills, a job description or minimum years.", "bad", "⛔"),
+                        unsafe_allow_html=True,
+                    )
 
                 top_n = min(int(shortlist_size), len(results))
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Resumes scored", len(results))
-                m2.metric("Top score", f"{results[0]['score']:.1f}")
-                m3.metric("Average score", f"{sum(r['score'] for r in results) / len(results):.1f}")
+                average = sum(float(r["score"]) for r in results) / len(results)
+                st.markdown(
+                    kpis_html(
+                        [
+                            kpi_card("Resumes scored", len(results)),
+                            kpi_card("Top score", f"{float(results[0]['score']):.1f}", "out of 100", score_tone(float(results[0]["score"]))),
+                            kpi_card("Average score", f"{average:.1f}", "across all resumes"),
+                            kpi_card("Shortlisted", top_n, "top-ranked candidates"),
+                        ]
+                    ),
+                    unsafe_allow_html=True,
+                )
+                st.markdown(results_table_html(results, top_n, bool(reveal_files)), unsafe_allow_html=True)
 
-                df = results_to_dataframe(results, include_file_names=show_files)
-                df.insert(2, "Shortlist", ["Yes" if r["rank"] <= top_n else "" for r in results])
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                export_df = results_to_dataframe(results, include_file_names=bool(reveal_files))
+                export_df.insert(2, "Shortlist", ["Yes" if r["rank"] <= top_n else "" for r in results])
                 st.download_button(
                     "⬇️ Download ranking (CSV)",
-                    data=dataframe_to_csv_bytes(df),
+                    data=dataframe_to_csv_bytes(export_df),
                     file_name="fairhire_ranking.csv",
                     mime="text/csv",
                 )
 
-                st.markdown("#### Why each candidate scored as they did")
-                for item in results:
-                    label = f"#{item['rank']} {item['candidate_id']} - {item['score']:.1f}/100"
-                    if show_files:
-                        label += f" ({item['file_name']})"
-                    with st.expander(label):
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.markdown("**Matched skills**")
-                            st.write(", ".join(item["matched_skills"]) or "None")
-                            st.markdown("**Missing skills**")
-                            st.write(", ".join(item["missing_skills"]) or "None")
-                        with c2:
-                            st.markdown("**Other skills detected**")
-                            st.write(", ".join(item["extra_skills"]) or "None")
-                            st.markdown("**Detected experience**")
-                            st.write(f"{item['years_experience']} years")
-                        st.progress(int(round(item["score"])))
-                        for reason in item["reasons"]:
-                            st.write("• " + reason)
-                        with st.popover("View text used for scoring"):
-                            st.text(item["text_used"][:3000])
+                st.markdown(section_html("Why each candidate scored as they did"), unsafe_allow_html=True)
+                st.markdown(
+                    "".join(
+                        candidate_card_html(item, bool(reveal_files), open_card=(index == 0))
+                        for index, item in enumerate(results)
+                    ),
+                    unsafe_allow_html=True,
+                )
 
     # ------------------------------------------------------------------ Audit tab
     with tab_audit:
-        st.subheader("Fairness audit")
-        st.warning(
-            "SIMULATION: the data below is synthetic. It demonstrates how the metrics behave; "
-            "it is **not** evidence about real candidates or about your hiring process."
+        st.markdown(section_html("Fairness audit"), unsafe_allow_html=True)
+        st.markdown(
+            note_html(
+                "SIMULATION: the data below is synthetic. It shows how the metrics behave; it is not evidence "
+                "about real candidates or about your hiring process.",
+                "warn",
+                "🧪",
+            ),
+            unsafe_allow_html=True,
         )
         a1, a2, a3, a4 = st.columns(4)
         n_syn = a1.slider("Synthetic candidates", 50, 1000, 300, step=50)
-        bias = a2.slider("Simulated reviewer bias against Group B (points)", 0, 40, 15)
+        bias = a2.slider("Simulated bias vs Group B (pts)", 0, 40, 15)
         frac = a3.slider("Shortlist fraction", 0.05, 0.6, 0.25, step=0.05)
         seed = a4.number_input("Random seed", min_value=0, max_value=10_000, value=42, step=1)
 
@@ -969,26 +1335,17 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
 
         syn = state["synthetic"]
         if syn is not None and len(syn):
-            col_m, col_b = st.columns(2)
+            col_m, col_b = st.columns(2, gap="large")
             for column, title, flag in (
                 (col_m, "Merit-only ranking (no simulated bias)", "selected_merit_only"),
                 (col_b, "Biased process (simulated reviewer penalty)", "selected_biased_process"),
             ):
                 report = fairness_report(syn["group"].tolist(), syn[flag].tolist())
                 with column:
-                    st.markdown(f"**{title}**")
-                    rates = pd.Series(report["rates"], name="Selection rate").sort_index()
-                    st.bar_chart(rates)
-                    st.metric("Demographic parity difference", f"{report['demographic_parity_difference']:.3f}")
-                    ratio = report["disparate_impact_ratio"]
-                    st.metric("Disparate impact ratio", "undefined" if ratio is None else f"{ratio:.3f}")
-                    if report["four_fifths_pass"] is True:
-                        st.success("Ratio is at or above 0.80 (passes the four-fifths rule of thumb).")
-                    elif report["four_fifths_pass"] is False:
-                        st.error("Ratio is below 0.80 - flag for review (screening heuristic only).")
-                    for note in report["notes"]:
-                        st.caption(note)
-            st.dataframe(syn, use_container_width=True, hide_index=True)
+                    st.markdown(fairness_panel_html(title, report), unsafe_allow_html=True)
+
+            st.markdown(section_html("Synthetic data preview"), unsafe_allow_html=True)
+            st.markdown(df_table_html(syn, 50), unsafe_allow_html=True)
             st.download_button(
                 "⬇️ Download synthetic data (CSV)",
                 data=dataframe_to_csv_bytes(syn),
@@ -996,35 +1353,34 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 mime="text/csv",
             )
 
-        st.markdown("---")
-        st.markdown("#### Audit your own outcomes table (optional)")
-        st.caption("Upload a CSV with one row per person, a group column and a selected/not-selected column.")
+        st.markdown(section_html("Audit your own outcomes table (optional)"), unsafe_allow_html=True)
+        st.caption("Upload a CSV with one row per person, a group column and a selected / not-selected column.")
         outcomes = st.file_uploader("Outcomes CSV", type=["csv"], key="outcomes_csv")
         if outcomes is not None:
+            table = None
             try:
                 table = pd.read_csv(io.BytesIO(outcomes.getvalue()))
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not read the CSV ({type(exc).__name__}).")
-                table = None
+                st.markdown(note_html(f"Could not read the CSV ({type(exc).__name__}).", "bad", "⛔"), unsafe_allow_html=True)
             if table is not None and len(table.columns) >= 2:
-                g_col = st.selectbox("Group column", table.columns, index=0)
-                s_col = st.selectbox("Selected column", table.columns, index=1)
+                g_col = st.selectbox("Group column", list(table.columns), index=0)
+                s_col = st.selectbox("Selected column", list(table.columns), index=1)
                 try:
                     report = audit_uploaded_outcomes(table, g_col, s_col)
-                    st.write("Selection rates", pd.Series(report["rates"], name="rate"))
-                    ratio = report["disparate_impact_ratio"]
-                    st.metric("Demographic parity difference", f"{report['demographic_parity_difference']:.3f}")
-                    st.metric("Disparate impact ratio", "undefined" if ratio is None else f"{ratio:.3f}")
-                    for note in report["notes"]:
-                        st.caption(note)
+                    st.markdown(fairness_panel_html("Your outcomes", report), unsafe_allow_html=True)
                 except ValueError as exc:
-                    st.error(str(exc))
+                    st.markdown(note_html(str(exc), "bad", "⛔"), unsafe_allow_html=True)
             elif table is not None:
-                st.error("The CSV needs at least two columns.")
+                st.markdown(note_html("The CSV needs at least two columns.", "bad", "⛔"), unsafe_allow_html=True)
 
     # ------------------------------------------------------------------ Methodology tab
     with tab_method:
         st.markdown(METHODOLOGY_MD)
+
+    st.markdown(
+        '<div class="fh-footer">FairHire is decision support, not a decision maker. A human reviews every outcome.</div>',
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
