@@ -931,21 +931,41 @@ hr {border-color: var(--border) !important;}
 .fh-rate {margin: .5rem 0;} .fh-rate-head {display: flex; justify-content: space-between; font-size: .85rem; margin-bottom: .25rem; color: var(--text);}
 .fh-rate-head span:last-child {color: var(--muted); font-variant-numeric: tabular-nums;}
 .fh-rate .fh-bar {height: 12px;}
+.fh-theme-marker {display: none;}
 .fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
 @media (max-width: 720px) {.block-container {padding: .8rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
 
 
-def theme_css(dark: bool) -> str:
-    """Return a <style> block for the light or dark theme."""
-    palette = THEMES["dark" if dark else "light"]
+def _theme_vars(name: str) -> str:
+    palette = THEMES[name]
     variables = "".join(f"--{key}: {value};" for key, value in palette.items() if key != "scheme")
-    return (
-        "<style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');"
-        f":root {{{variables} color-scheme: {palette['scheme']};}}"
+    return variables + f"color-scheme: {palette['scheme']};"
+
+
+def theme_css(dark: bool) -> str:
+    """Return one minified <style> block containing BOTH themes.
+
+    The active theme is chosen by a marker element (see ``theme_marker_html``) using the
+    ``:has()`` selector, so the CSS text never changes when the user flips the toggle.
+    A plain ``:root`` block for the current mode is included as a fallback for browsers
+    that do not support ``:has()``.
+    """
+    mode = "dark" if dark else "light"
+    css = (
+        "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');"
+        f":root {{{_theme_vars(mode)}}}"
+        f":root:not(:has(.fh-dark-marker)) {{{_theme_vars('light')}}}"
+        f":root:has(.fh-dark-marker) {{{_theme_vars('dark')}}}"
         + BASE_CSS
-        + "</style>"
     )
+    css = re.sub(r"\s+", " ", css).strip()  # one line, no blank lines (Markdown-safe)
+    return f"<style>{css}</style>"
+
+
+def theme_marker_html(dark: bool) -> str:
+    """Tiny element whose presence switches the page to the dark palette."""
+    return '<div class="fh-theme-marker fh-dark-marker"></div>' if dark else '<div class="fh-theme-marker"></div>'
 
 
 def _esc(value: object) -> str:
@@ -1180,7 +1200,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     with top_right:
         st.toggle("🌙 Dark mode", key="dark_mode")
     dark = bool(state.get("dark_mode"))
-    st.markdown(theme_css(dark), unsafe_allow_html=True)
+    st.markdown(theme_css(dark) + theme_marker_html(dark), unsafe_allow_html=True)
     with top_left:
         st.markdown(hero_html(), unsafe_allow_html=True)
 
