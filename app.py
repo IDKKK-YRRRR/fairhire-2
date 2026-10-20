@@ -830,7 +830,7 @@ html, body, .stApp, button, input, textarea, select {font-family: 'Inter', syste
 [data-testid="stHeader"] {background: transparent !important;}
 [data-testid="stHeader"] * {color: var(--muted);}
 #MainMenu, footer {visibility: hidden;}
-.block-container {max-width: 1280px; padding: 1.25rem 1.5rem 3rem;}
+.block-container {max-width: 1280px; padding: 4.5rem 1.5rem 3rem;}
 h1, h2, h3, h4, h5, h6, label, [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
 [data-testid="stWidgetLabel"] p {color: var(--text) !important;}
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {color: var(--muted) !important;}
@@ -935,7 +935,7 @@ hr {border-color: var(--border) !important;}
 .fh-theme-marker {display: none;}
 .fh-theme-label {font-size: .75rem; color: var(--muted); text-align: right; margin-top: -.4rem;}
 .fh-footer {text-align: center; color: var(--muted); font-size: .8rem; margin-top: 2rem;}
-@media (max-width: 720px) {.block-container {padding: .8rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
+@media (max-width: 720px) {.block-container {padding: 4.2rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
 
 
