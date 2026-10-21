@@ -11,7 +11,6 @@ import sys
 import unittest
 
 import app  # must NOT launch the Streamlit interface on import
-import auth
 
 
 class ImportSafetyTests(unittest.TestCase):
@@ -626,306 +625,6 @@ class ReviewAndReportTests(unittest.TestCase):
         self.assertIn("No reviewer decisions", empty)
 
 
-class AuthTestCase(unittest.TestCase):
-    """Base class: fresh in-memory database, cheap hashing so tests stay fast."""
-
-    def setUp(self):
-        self._old_iterations = auth.HASH_ITERATIONS
-        auth.HASH_ITERATIONS = 1000
-        auth._DUMMY_HASH = None
-        self.conn = auth.open_db(":memory:")
-        self.pw = "Correct-Horse-42"
-
-    def tearDown(self):
-        auth.HASH_ITERATIONS = self._old_iterations
-        auth._DUMMY_HASH = None
-        self.conn.close()
-
-    def make_user(self, email, **kwargs):
-        user, error = auth.create_user(self.conn, email, kwargs.pop("password", self.pw), **kwargs)
-        self.assertIsNone(error, error)
-        return user
-
-
-class PasswordAndValidationTests(AuthTestCase):
-    def test_password_policy(self):
-        self.assertIsNotNone(auth.validate_password("short1A"))
-        self.assertIsNotNone(auth.validate_password("1234567890"))
-        self.assertIsNotNone(auth.validate_password("password123"))
-        self.assertIsNotNone(auth.validate_password("alllowercaseletters"))
-        self.assertIsNotNone(auth.validate_password("x" * 129))
-        self.assertIsNotNone(auth.validate_password("Jonathan-2024!", "jonathan@example.com"))
-        self.assertIsNone(auth.validate_password("Correct-Horse-42", "jo@example.com"))
-
-    def test_email_validation_and_normalisation(self):
-        self.assertIsNone(auth.validate_email("a.b+c@example.co.uk"))
-        for bad in ["", "no-at-sign", "a@b", "a@@b.com", "a b@c.com", "x" * 250 + "@a.com"]:
-            self.assertIsNotNone(auth.validate_email(bad), bad)
-        self.assertEqual(auth.normalize_email("  Bob@Example.COM "), "bob@example.com")
-
-    def test_hash_and_verify(self):
-        stored = auth.hash_password("Correct-Horse-42")
-        self.assertTrue(stored.startswith("pbkdf2_sha256$"))
-        self.assertNotIn("Correct-Horse-42", stored)
-        self.assertTrue(auth.verify_password("Correct-Horse-42", stored))
-        self.assertFalse(auth.verify_password("wrong", stored))
-        self.assertNotEqual(stored, auth.hash_password("Correct-Horse-42"))  # random salt
-        for broken in ["", "garbage", "a$b$c$d", "pbkdf2_sha256$x$zz$yy"]:
-            self.assertFalse(auth.verify_password("x", broken))
-
-
-class UserAndLoginTests(AuthTestCase):
-    def test_first_user_is_admin_then_recruiters(self):
-        first = self.make_user("Boss@Example.com")
-        second = self.make_user("rec@example.com")
-        self.assertEqual(first["role"], "admin")
-        self.assertEqual(first["email"], "boss@example.com")
-        self.assertEqual(second["role"], "recruiter")
-
-    def test_admin_email_rule(self):
-        a = self.make_user("rec@example.com", admin_email="boss@example.com")
-        b = self.make_user("boss@example.com", admin_email="boss@example.com")
-        self.assertEqual((a["role"], b["role"]), ("recruiter", "admin"))
-
-    def test_duplicate_and_weak_signups_rejected(self):
-        self.make_user("a@example.com")
-        self.assertIn("already exists", auth.create_user(self.conn, "A@example.com", self.pw)[1])
-        self.assertIsNotNone(auth.create_user(self.conn, "b@example.com", "weak")[1])
-        self.assertIsNotNone(auth.create_user(self.conn, "not-an-email", self.pw)[1])
-        self.assertIsNotNone(auth.create_user(self.conn, "c@example.com", self.pw, role="root")[1])
-
-    def test_passwords_are_not_stored_in_plain_text(self):
-        self.make_user("a@example.com")
-        row = self.conn.execute("SELECT password_hash FROM users").fetchone()
-        self.assertNotIn(self.pw, row[0])
-
-    def test_login_success_and_generic_errors(self):
-        self.make_user("a@example.com")
-        user, error = auth.authenticate(self.conn, " A@Example.com ", self.pw)
-        self.assertIsNone(error)
-        self.assertEqual(user["email"], "a@example.com")
-        _, wrong = auth.authenticate(self.conn, "a@example.com", "nope")
-        _, unknown = auth.authenticate(self.conn, "nobody@example.com", "nope")
-        self.assertEqual(wrong, unknown)  # cannot tell which emails exist
-        self.assertEqual(wrong, auth.GENERIC_LOGIN_ERROR)
-
-    def test_lockout_and_expiry(self):
-        self.make_user("a@example.com")
-        now = 1_000_000.0
-        for _ in range(auth.MAX_FAILED_ATTEMPTS):
-            auth.authenticate(self.conn, "a@example.com", "bad", now=now)
-        user, error = auth.authenticate(self.conn, "a@example.com", self.pw, now=now + 10)
-        self.assertIsNone(user)
-        self.assertIn("Too many", error)
-        user, error = auth.authenticate(self.conn, "a@example.com", self.pw, now=now + auth.LOCK_SECONDS + 1)
-        self.assertIsNone(error)
-
-    def test_unverified_user_cannot_sign_in(self):
-        self.make_user("a@example.com", verified=False)
-        user, error = auth.authenticate(self.conn, "a@example.com", self.pw)
-        self.assertIsNone(user)
-        self.assertIn("verify", error)
-        auth.set_verified(self.conn, auth.get_user_by_email(self.conn, "a@example.com")["id"])
-        self.assertIsNotNone(auth.authenticate(self.conn, "a@example.com", self.pw)[0])
-
-    def test_sql_injection_attempts_are_harmless(self):
-        self.make_user("a@example.com")
-        user, error = auth.authenticate(self.conn, "' OR '1'='1", "' OR '1'='1")
-        self.assertIsNone(user)
-        user, _ = auth.authenticate(self.conn, "a@example.com' --", self.pw)
-        self.assertIsNone(user)
-        job_id, _ = auth.save_job(self.conn, 1, "x'); DROP TABLE users; --", "jd", {})
-        self.assertIsNotNone(job_id)
-        self.assertEqual(auth.count_users(self.conn), 1)
-
-
-class CodeAndPasswordChangeTests(AuthTestCase):
-    def test_code_flow(self):
-        u = self.make_user("a@example.com")
-        code = auth.issue_code(self.conn, u["id"], "reset", now=100.0)
-        self.assertRegex(code, r"^\d{6}$")
-        self.assertFalse(auth.check_code(self.conn, u["id"], "verify", code, now=101.0))  # wrong purpose
-        self.assertTrue(auth.check_code(self.conn, u["id"], "reset", code, now=101.0))
-        self.assertFalse(auth.check_code(self.conn, u["id"], "reset", code, now=102.0))  # single use
-
-    def test_code_expiry_and_attempt_limit(self):
-        u = self.make_user("a@example.com")
-        code = auth.issue_code(self.conn, u["id"], "reset", now=100.0)
-        self.assertFalse(auth.check_code(self.conn, u["id"], "reset", code, now=100.0 + auth.CODE_TTL_SECONDS + 1))
-        code = auth.issue_code(self.conn, u["id"], "reset", now=100.0)
-        wrong = "000000" if code != "000000" else "111111"
-        for _ in range(auth.MAX_CODE_ATTEMPTS):
-            self.assertFalse(auth.check_code(self.conn, u["id"], "reset", wrong, now=101.0))
-        self.assertFalse(auth.check_code(self.conn, u["id"], "reset", code, now=102.0))  # locked out
-
-    def test_change_password(self):
-        u = self.make_user("a@example.com")
-        self.assertIn("not correct", auth.change_password(self.conn, u["id"], "wrong", "Another-Pass-77"))
-        self.assertIn("different", auth.change_password(self.conn, u["id"], self.pw, self.pw))
-        self.assertIsNotNone(auth.change_password(self.conn, u["id"], self.pw, "weak"))
-        self.assertIsNone(auth.change_password(self.conn, u["id"], self.pw, "Another-Pass-77"))
-        self.assertIsNone(auth.authenticate(self.conn, "a@example.com", "Another-Pass-77")[1])
-        self.assertIsNotNone(auth.authenticate(self.conn, "a@example.com", self.pw)[1])
-
-    def test_set_password_validates_and_clears_flags(self):
-        u = self.make_user("a@example.com", must_change=True)
-        self.assertTrue(u["must_change"])
-        self.assertIsNotNone(auth.set_password(self.conn, u["id"], "short"))
-        self.assertIsNone(auth.set_password(self.conn, u["id"], "Brand-New-Pass-9"))
-        self.assertFalse(auth.get_user(self.conn, u["id"])["must_change"])
-        self.assertEqual(auth.set_password(self.conn, 999, "Brand-New-Pass-9"), "Account not found.")
-
-
-class RoleTests(AuthTestCase):
-    def setUp(self):
-        super().setUp()
-        self.admin = self.make_user("admin@example.com")
-        self.rec = self.make_user("rec@example.com")
-        self.other = self.make_user("other@example.com")
-
-    def test_recruiter_cannot_use_admin_functions(self):
-        for call in (
-            lambda: auth.list_users(self.conn, self.rec["id"]),
-            lambda: auth.set_role(self.conn, self.rec["id"], self.other["id"], "admin"),
-            lambda: auth.delete_user(self.conn, self.rec["id"], self.other["id"]),
-            lambda: auth.admin_reset_password(self.conn, self.rec["id"], self.other["id"]),
-        ):
-            with self.assertRaises(PermissionError):
-                call()
-        with self.assertRaises(PermissionError):
-            auth.list_users(self.conn, 9999)  # unknown actor
-
-    def test_role_change_takes_effect_immediately(self):
-        self.assertIsNone(auth.set_role(self.conn, self.admin["id"], self.rec["id"], "admin"))
-        self.assertEqual(len(auth.list_users(self.conn, self.rec["id"])), 3)
-        self.assertIsNone(auth.set_role(self.conn, self.admin["id"], self.rec["id"], "recruiter"))
-        with self.assertRaises(PermissionError):
-            auth.list_users(self.conn, self.rec["id"])
-
-    def test_admin_guard_rails(self):
-        self.assertIn("own role", auth.set_role(self.conn, self.admin["id"], self.admin["id"], "recruiter"))
-        self.assertIn("own account", auth.delete_user(self.conn, self.admin["id"], self.admin["id"]))
-        self.assertIsNotNone(auth.set_role(self.conn, self.admin["id"], self.rec["id"], "root"))
-        self.assertIsNotNone(auth.set_role(self.conn, self.admin["id"], 999, "admin"))
-
-    def test_admin_sees_counts_not_content(self):
-        auth.save_job(self.conn, self.rec["id"], "Secret job", "secret description", {})
-        auth.save_report(self.conn, self.rec["id"], "Secret report", "screening", "<p>secret</p>", {})
-        rows = {u["email"]: u for u in auth.list_users(self.conn, self.admin["id"])}
-        self.assertEqual((rows["rec@example.com"]["jobs"], rows["rec@example.com"]["reports"]), (1, 1))
-        for row in rows.values():
-            self.assertNotIn("secret", json.dumps(row).lower())
-        self.assertNotIn("password_hash", rows["rec@example.com"])
-        report_id = auth.list_reports(self.conn, self.rec["id"])[0]["id"]
-        self.assertIsNone(auth.get_report_html(self.conn, self.admin["id"], report_id))
-
-    def test_admin_reset_password_forces_change(self):
-        temporary, error = auth.admin_reset_password(self.conn, self.admin["id"], self.rec["id"])
-        self.assertIsNone(error)
-        user, err = auth.authenticate(self.conn, "rec@example.com", temporary)
-        self.assertIsNone(err)
-        self.assertTrue(user["must_change"])
-        self.assertIsNotNone(auth.authenticate(self.conn, "rec@example.com", self.pw)[1])
-        self.assertEqual(auth.admin_reset_password(self.conn, self.admin["id"], 999)[1], "Account not found.")
-
-    def test_delete_user_removes_their_data(self):
-        auth.save_job(self.conn, self.rec["id"], "J", "jd", {})
-        auth.save_report(self.conn, self.rec["id"], "R", "audit", "<p>x</p>", {})
-        self.assertIsNone(auth.delete_user(self.conn, self.admin["id"], self.rec["id"]))
-        self.assertIsNone(auth.get_user(self.conn, self.rec["id"]))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0], 0)
-
-
-class UserDataIsolationTests(AuthTestCase):
-    def setUp(self):
-        super().setUp()
-        self.a = self.make_user("a@example.com")
-        self.b = self.make_user("b@example.com")
-
-    def test_jobs_are_private(self):
-        job_id, error = auth.save_job(self.conn, self.a["id"], "Data Scientist", "jd text", {"required": ["python"], "min_years": 2})
-        self.assertIsNone(error)
-        job = auth.get_job(self.conn, self.a["id"], job_id)
-        self.assertEqual(job["settings"]["required"], ["python"])
-        self.assertIsNone(auth.get_job(self.conn, self.b["id"], job_id))
-        self.assertFalse(auth.delete_job(self.conn, self.b["id"], job_id))
-        self.assertEqual(auth.list_jobs(self.conn, self.b["id"]), [])
-        self.assertTrue(auth.delete_job(self.conn, self.a["id"], job_id))
-
-    def test_reports_are_private(self):
-        report_id, error = auth.save_report(self.conn, self.a["id"], "Q3 screening", "screening", "<p>hi</p>", {"n": 3})
-        self.assertIsNone(error)
-        self.assertEqual(auth.get_report_html(self.conn, self.a["id"], report_id), "<p>hi</p>")
-        self.assertIsNone(auth.get_report_html(self.conn, self.b["id"], report_id))
-        self.assertFalse(auth.delete_report(self.conn, self.b["id"], report_id))
-        self.assertEqual(auth.list_reports(self.conn, self.b["id"]), [])
-        listed = auth.list_reports(self.conn, self.a["id"], kind="screening")
-        self.assertEqual(listed[0]["summary"], {"n": 3})
-        self.assertEqual(auth.list_reports(self.conn, self.a["id"], kind="audit"), [])
-        self.assertTrue(auth.delete_report(self.conn, self.a["id"], report_id))
-
-    def test_validation_and_limits(self):
-        self.assertIsNotNone(auth.save_job(self.conn, self.a["id"], "  ", "jd", {})[1])
-        self.assertIsNotNone(auth.save_job(self.conn, self.a["id"], "x" * 121, "jd", {})[1])
-        self.assertIsNotNone(auth.save_job(self.conn, self.a["id"], "t", "x" * (auth.MAX_JD_CHARS + 1), {})[1])
-        self.assertIsNotNone(auth.save_report(self.conn, self.a["id"], "t", "weird", "<p/>", {})[1])
-        self.assertIsNotNone(auth.save_report(self.conn, self.a["id"], "t", "audit", "x" * (auth.MAX_REPORT_BYTES + 1), {})[1])
-        old = auth.MAX_JOBS_PER_USER
-        auth.MAX_JOBS_PER_USER = 1
-        try:
-            self.assertIsNone(auth.save_job(self.conn, self.a["id"], "one", "jd", {})[1])
-            self.assertIn("up to", auth.save_job(self.conn, self.a["id"], "two", "jd", {})[1])
-            self.assertIsNone(auth.save_job(self.conn, self.b["id"], "mine", "jd", {})[1])  # per-user cap
-        finally:
-            auth.MAX_JOBS_PER_USER = old
-
-
-class EmailTests(unittest.TestCase):
-    CONF = {"host": "smtp.example.com", "port": 465, "username": "u", "password": "p", "sender": "noreply@example.com"}
-
-    def test_configuration_detection(self):
-        self.assertTrue(auth.smtp_configured(self.CONF))
-        self.assertFalse(auth.smtp_configured({"host": "x"}))
-        self.assertFalse(auth.smtp_configured(None))
-        self.assertEqual(auth.send_email(None, "a@b.co", "s", "b"), (False, "Email is not configured."))
-
-    def test_send_success_and_failure_do_not_leak_details(self):
-        from unittest import mock
-
-        sent = []
-
-        class FakeSMTP:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def login(self, user, password):
-                sent.append(("login", user))
-
-            def send_message(self, message):
-                sent.append(("send", message["To"], message["Subject"]))
-
-        with mock.patch.object(auth.smtplib, "SMTP_SSL", FakeSMTP):
-            self.assertEqual(auth.send_email(self.CONF, "a@b.co", "Hello", "Body"), (True, None))
-        self.assertIn(("send", "a@b.co", "Hello"), sent)
-
-        class BrokenSMTP(FakeSMTP):
-            def login(self, user, password):
-                raise OSError("secret server detail p@ssw0rd")
-
-        with mock.patch.object(auth.smtplib, "SMTP_SSL", BrokenSMTP):
-            ok, error = auth.send_email(self.CONF, "a@b.co", "Hello", "Body")
-        self.assertFalse(ok)
-        self.assertNotIn("secret", error)
-        self.assertIn("OSError", error)
-
-
 class AccountUiHelperTests(unittest.TestCase):
     def test_brand_html(self):
         out = app.auth_brand_html()
@@ -971,27 +670,94 @@ class AccountUiHelperTests(unittest.TestCase):
         self.assertIn("fairness audit", out)
         self.assertIn("No fairness results", app.build_audit_report_html([]))
 
-    def test_read_app_secrets(self):
-        class FakeStreamlit:
-            def __init__(self, secrets):
-                self.secrets = secrets
-
-        smtp, admin = app.read_app_secrets(FakeStreamlit({"smtp": {"host": "h", "port": 465}, "admin_email": "a@b.co"}))
-        self.assertEqual((smtp["host"], admin), ("h", "a@b.co"))
-        self.assertEqual(app.read_app_secrets(FakeStreamlit({})), (None, None))
-
-        class Exploding:
-            @property
-            def secrets(self):
-                raise RuntimeError("no secrets file")
-
-        self.assertEqual(app.read_app_secrets(Exploding()), (None, None))
-        self.assertEqual(app.read_app_secrets(FakeStreamlit({"admin_email": 5}))[1], None)
-
     def test_sign_out_clears_everything_except_theme(self):
         state = {"user": {"id": 1}, "dark_mode": True, "intro_done": True, "docs": [1], "jd_text": "secret", "dec_x": "Advance"}
         app.sign_out(state)
         self.assertEqual(state, {"dark_mode": True, "intro_done": True})
+
+
+class PrototypeAccountTests(unittest.TestCase):
+    def test_nothing_real_is_stored(self):
+        import inspect
+
+        source = inspect.getsource(app)
+        for forbidden in ("sqlite3", "pbkdf2", "smtplib", "hashlib.scrypt", "open("):
+            self.assertNotIn(forbidden, source, forbidden)
+        self.assertFalse(hasattr(app, "auth"))
+
+    def test_password_strength_and_meter(self):
+        self.assertEqual(app.password_strength("")["label"], "Enter a password")
+        self.assertEqual(app.password_strength("short1A!")["label"], "Too short")
+        self.assertEqual(app.password_strength("alllowercaseletters")["label"], "Weak")
+        self.assertEqual(app.password_strength("Correct-Horse-42")["label"], "Strong")
+        self.assertEqual(app.password_strength("Correcthorse42")["label"], "Good")
+        for pw in ["", "abc", "Correct-Horse-42", "<script>alert(1)</script>", "$$$ $$$"]:
+            out = app.password_meter_html(pw)
+            self.assertNotIn("\n", out)
+            self.assertNotIn("<script>", out)
+            if pw:
+                self.assertNotIn(pw, out)  # the meter never echoes the password back
+        self.assertIn("width:0%", app.password_meter_html(""))
+        self.assertIn("width:100%", app.password_meter_html("Correct-Horse-42"))
+
+    def test_validation_messages(self):
+        self.assertEqual(app.prototype_signup_errors("a@b.co", "Correct-Horse-42", "Correct-Horse-42", True), [])
+        errors = app.prototype_signup_errors("nope", "short", "different", False)
+        self.assertEqual(len(errors), 4)
+        self.assertEqual(app.prototype_signin_errors("a@b.co", "x"), [])
+        self.assertEqual(len(app.prototype_signin_errors("", "")), 2)
+        self.assertEqual(app.prototype_password_errors("Correct-Horse-42", "Correct-Horse-42"), [])
+        self.assertTrue(app.simple_email_ok("a.b+c@example.co.uk"))
+        self.assertFalse(app.simple_email_ok("a@b"))
+        self.assertFalse(app.simple_email_ok(None))
+
+    def test_roles_and_demo_user_have_no_password(self):
+        self.assertEqual(app.role_for_email("Admin.demo@example.com"), "admin")
+        self.assertEqual(app.role_for_email("asha@example.com"), "recruiter")
+        user = app.make_demo_user("  Boss@Example.com ", "admin")
+        self.assertEqual((user["email"], user["role"]), ("boss@example.com", "admin"))
+        self.assertEqual(app.make_demo_user("a@b.co", "root")["role"], "recruiter")
+        self.assertNotIn("password", json.dumps(user).lower())
+
+    def test_start_session_seeds_sample_data_once(self):
+        state = {}
+        app._start_session(state, "a@example.com", "recruiter")
+        self.assertEqual(state["user"]["email"], "a@example.com")
+        self.assertEqual(len(state["saved_jobs"]), 2)
+        self.assertEqual(sorted(r["kind"] for r in state["saved_reports"]), ["audit", "screening"])
+        self.assertTrue(all("(sample)" in x["title"] for x in state["saved_jobs"] + state["saved_reports"]))
+        self.assertEqual(len(state["demo_users"]), 3)
+        app._start_session(state, "a@example.com", "recruiter")
+        self.assertEqual(len(state["saved_jobs"]), 2)  # not seeded twice
+        self.assertNotIn("password", json.dumps({k: v for k, v in state.items() if k != "saved_reports"}).lower())
+
+    def test_saved_items_are_session_only_and_limited(self):
+        state = {}
+        self.assertIsNone(app.add_saved_job(state, "My job", "jd", {"required": ["python"]}))
+        self.assertIsNotNone(app.add_saved_job(state, "  ", "jd", {}))
+        self.assertIsNotNone(app.add_saved_job(state, "x" * 121, "jd", {}))
+        job_id = state["saved_jobs"][0]["id"]
+        self.assertTrue(app.delete_saved(state, "saved_jobs", job_id))
+        self.assertFalse(app.delete_saved(state, "saved_jobs", job_id))
+        self.assertIsNone(app.add_saved_report(state, "audit", "A", "<p>x</p>", {}))
+        self.assertIsNotNone(app.add_saved_report(state, "weird", "A", "<p>x</p>", {}))
+        self.assertIsNotNone(app.add_saved_report(state, "audit", "A", "x" * (app.MAX_SAVED_REPORT_BYTES + 1), {}))
+        for i in range(app.MAX_SAVED_ITEMS):
+            app.add_saved_job(state, f"job {i}", "", {})
+        self.assertIn("up to", app.add_saved_job(state, "one too many", "", {}))
+
+    def test_admin_actions_only_touch_fake_accounts(self):
+        state = {}
+        app.seed_demo_data(state)
+        email = state["demo_users"][0]["email"]
+        self.assertIn("administrator", app.demo_user_action(state, email, "Make administrator"))
+        self.assertEqual(state["demo_users"][0]["role"], "admin")
+        self.assertIn("recruiter", app.demo_user_action(state, email, "Make recruiter"))
+        self.assertIn("Nothing was changed", app.demo_user_action(state, email, "Reset password"))
+        self.assertIn("deleted", app.demo_user_action(state, email, "Delete account"))
+        self.assertEqual(app.demo_user_action(state, email, "Delete account"), "Account not found.")
+        self.assertEqual(app.demo_user_action(state, state["demo_users"][0]["email"], "Explode"), "Unknown action.")
+        self.assertTrue(all(u["email"].endswith("@example.com") for u in app.SAMPLE_USERS))
 
 
 if __name__ == "__main__":
