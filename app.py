@@ -27,8 +27,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-import auth
-
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
@@ -1377,12 +1375,11 @@ that there is no bias. With three or more groups no multiple-comparison correcti
 You record Advance, Hold or Reject for each candidate, with a job-related reason required for Hold and Reject. The
 downloadable report bundles the settings, ranking, explanations, flags, fairness results and your decisions.
 
-### Accounts and privacy
-Recruiters sign in with an email and password (stored only as salted hashes). Each person sees only their own saved jobs,
-reports and audits. Administrators can manage accounts but cannot read anyone's saved data. Resumes are processed in memory
-and never stored; saved reports contain candidate numbers, scores, explanations and short evidence snippets for proxy flags.
-Email verification and email password reset work only if an email service is configured; otherwise an administrator resets
-passwords. On free hosting the local database can be wiped when the app restarts, so treat saved data as temporary.
+### Accounts (prototype)
+The sign-up, sign-in, email-code, password-reset, dashboard and administrator screens are a **prototype**. No account is
+created, no password is kept, no email is sent and nothing is written to a database. Saved jobs, reports and audits live only
+in this browser tab and disappear when you close it or sign out. Items marked (sample) are made up. A real version would need
+password hashing, a database, email delivery and access controls. Resumes are never saved.
 
 ### Limitations and responsible use
 * Masking identity does not make a process unbiased. Skills lists, schools, employers, gaps and writing style can
@@ -1568,6 +1565,7 @@ mark.fh-add {background: var(--ok_soft); color: var(--ok); border-radius: 4px; p
 .fh-brand-tag {color: var(--muted); font-size: .85rem;}
 .fh-auth-title {font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; margin: 1.1rem 0 .4rem; color: var(--text);}
 .fh-auth-sub {color: var(--muted); line-height: 1.55; margin-bottom: 1rem;}
+.fh-meter {margin: .2rem 0 .6rem;}
 @media (max-width: 720px) {.block-container {padding: 4.2rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
 
@@ -2030,48 +2028,235 @@ def build_audit_report_html(sections: Sequence[Dict[str, object]], generated_on:
     )
 
 
-def read_app_secrets(st) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
-    """Optional settings from Streamlit secrets: an [smtp] table and ``admin_email``."""
-    smtp_conf: Optional[Dict[str, str]] = None
-    admin_email: Optional[str] = None
-    try:
-        if "smtp" in st.secrets:
-            smtp_conf = {str(k): v for k, v in dict(st.secrets["smtp"]).items()}
-    except Exception:  # noqa: BLE001 - no secrets file is the normal case
-        smtp_conf = None
-    try:
-        value = st.secrets.get("admin_email")
-        admin_email = value if isinstance(value, str) and value.strip() else None
-    except Exception:  # noqa: BLE001
-        admin_email = None
-    return smtp_conf, admin_email
+# --------------------------------------------------------------------------------------
+# PROTOTYPE account flow
+#
+# Everything below is SIMULATED. No account is created, no password is kept, no email is
+# sent and nothing is written to disk or a database. "Saved" items live only in this
+# browser session (st.session_state) and disappear when the tab closes or you sign out.
+# --------------------------------------------------------------------------------------
+
+PROTOTYPE_BANNER = "Prototype mode: sign-in is simulated and saved items live only in this browser tab."
+PROTOTYPE_FOOTNOTE = "Illustrative prototype. No real accounts are created and nothing you enter is stored or sent."
+MAX_SAVED_ITEMS = 25
+MAX_SAVED_REPORT_BYTES = 1_000_000
+
+SAMPLE_USERS = [
+    {"id": 101, "email": "asha.recruiter@example.com", "role": "recruiter", "verified": True, "jobs": 3, "reports": 5, "created": "2026-09-02"},
+    {"id": 102, "email": "daniel.hr@example.com", "role": "recruiter", "verified": True, "jobs": 1, "reports": 2, "created": "2026-09-14"},
+    {"id": 103, "email": "mei.talent@example.com", "role": "recruiter", "verified": False, "jobs": 0, "reports": 0, "created": "2026-10-18"},
+]
+
+_SIMPLE_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}$")
+
+
+def simple_email_ok(email: str) -> bool:
+    email = (email or "").strip()
+    return bool(email) and len(email) <= 254 and bool(_SIMPLE_EMAIL_RE.match(email))
+
+
+def password_strength(password: str) -> Dict[str, object]:
+    """Feedback for the sign-up meter. Pure function; the password is not kept anywhere."""
+    password = password or ""
+    checks = [
+        ("10 or more characters", len(password) >= 10),
+        ("Upper and lower case letters", bool(re.search(r"[a-z]", password)) and bool(re.search(r"[A-Z]", password))),
+        ("A number", bool(re.search(r"\d", password))),
+        ("A symbol", bool(re.search(r"[^A-Za-z0-9]", password))),
+    ]
+    score = sum(1 for _, ok in checks if ok)
+    if not password:
+        label, tone = "Enter a password", "neutral"
+    elif len(password) < 10:
+        label, tone = "Too short", "bad"
+    elif score <= 2:
+        label, tone = "Weak", "warn"
+    elif score == 3:
+        label, tone = "Good", "ok"
+    else:
+        label, tone = "Strong", "ok"
+    return {"score": score, "label": label, "tone": tone, "checks": checks}
+
+
+def password_meter_html(password: str) -> str:
+    info = password_strength(password)
+    width = 0 if not password else max(8, 25 * int(info["score"]))
+    items = "".join(
+        f'<span class="fh-chip {"ok" if ok else "neutral"}">{"✓" if ok else "○"} {_esc(text)}</span>' for text, ok in info["checks"]
+    )
+    return (
+        f'<div class="fh-meter"><div class="fh-bar"><i style="width:{width}%;background:{_TONE_COLOR[str(info["tone"])]}"></i></div>'
+        f'<div class="fh-muted" style="font-size:.8rem;margin:.25rem 0">{_esc(info["label"])}</div><div>{items}</div></div>'
+    )
+
+
+def prototype_password_errors(password: str, confirm: str) -> List[str]:
+    errors = []
+    if len(password or "") < 10:
+        errors.append("Use at least 10 characters.")
+    if (password or "") != (confirm or ""):
+        errors.append("The two passwords do not match.")
+    return errors
+
+
+def prototype_signup_errors(email: str, password: str, confirm: str, agreed: bool) -> List[str]:
+    errors = []
+    if not simple_email_ok(email):
+        errors.append("Enter a valid email address.")
+    errors.extend(prototype_password_errors(password, confirm))
+    if not agreed:
+        errors.append("Tick the box to confirm you understand this is a prototype.")
+    return errors
+
+
+def prototype_signin_errors(email: str, password: str) -> List[str]:
+    errors = []
+    if not simple_email_ok(email):
+        errors.append("Enter a valid email address.")
+    if not (password or ""):
+        errors.append("Enter your password.")
+    return errors
+
+
+def role_for_email(email: str) -> str:
+    """Prototype shortcut: an address starting with 'admin' opens the administrator view."""
+    return "admin" if (email or "").strip().lower().startswith("admin") else "recruiter"
+
+
+def make_demo_user(email: str, role: str) -> Dict[str, object]:
+    return {
+        "id": 1,
+        "email": (email or "").strip().lower(),
+        "role": role if role in ("recruiter", "admin") else "recruiter",
+        "verified": True,
+        "must_change": False,
+        "created_at": now_utc_text(),
+    }
+
+
+# ---- in-memory "saved items" (session only) ------------------------------------------
+
+
+def _next_id(state) -> int:
+    state["next_id"] = int(state.get("next_id", 1000)) + 1
+    return int(state["next_id"])
+
+
+def _title_error(title: str) -> Optional[str]:
+    title = (title or "").strip()
+    if not title or len(title) > 120:
+        return "Give it a title of up to 120 characters."
+    return None
+
+
+def add_saved_job(state, title: str, jd_text: str, settings: Dict[str, object]) -> Optional[str]:
+    problem = _title_error(title)
+    if problem:
+        return problem
+    jobs = state.setdefault("saved_jobs", [])
+    if len(jobs) >= MAX_SAVED_ITEMS:
+        return f"The prototype keeps up to {MAX_SAVED_ITEMS} saved jobs. Delete one first."
+    jobs.append(
+        {"id": _next_id(state), "title": title.strip(), "jd_text": (jd_text or "")[:20000], "settings": settings, "created_at": now_utc_text()}
+    )
+    return None
+
+
+def add_saved_report(state, kind: str, title: str, html: str, summary: Dict[str, object]) -> Optional[str]:
+    problem = _title_error(title)
+    if problem:
+        return problem
+    if kind not in ("screening", "audit"):
+        return "Unknown report type."
+    if len((html or "").encode("utf-8")) > MAX_SAVED_REPORT_BYTES:
+        return "The report is too large to keep in the prototype."
+    reports = state.setdefault("saved_reports", [])
+    if len(reports) >= MAX_SAVED_ITEMS:
+        return f"The prototype keeps up to {MAX_SAVED_ITEMS} saved reports. Delete one first."
+    reports.append(
+        {"id": _next_id(state), "kind": kind, "title": title.strip(), "html": html or "", "summary": summary, "created_at": now_utc_text()}
+    )
+    return None
+
+
+def delete_saved(state, bucket: str, item_id: int) -> bool:
+    items = state.get(bucket, [])
+    for index, item in enumerate(items):
+        if item.get("id") == item_id:
+            del items[index]
+            return True
+    return False
+
+
+def seed_demo_data(state) -> None:
+    """Fill the dashboard with clearly labelled sample items the first time someone 'signs in'."""
+    if state.get("demo_seeded"):
+        return
+    state["demo_seeded"] = True
+    state["demo_users"] = [dict(u) for u in SAMPLE_USERS]
+    add_saved_job(
+        state, "Data Scientist (sample)", SAMPLE_JOB_DESCRIPTION,
+        {"required": list(DEFAULT_REQUIRED_SKILLS), "extra": "", "custom_skills_text": "", "min_years": 2.0, "weights": [60, 25, 15], "shortlist": 3},
+    )
+    add_saved_job(
+        state, "Backend Developer (sample)", "We need a backend developer with Java, SQL and REST API experience. Minimum 3 years of experience.",
+        {"required": ["java", "sql", "rest api"], "extra": "", "custom_skills_text": "", "min_years": 3.0, "weights": [60, 25, 15], "shortlist": 3},
+    )
+    results, _ = screen_resumes(list(SAMPLE_RESUMES.items()), DEFAULT_REQUIRED_SKILLS, SAMPLE_JOB_DESCRIPTION, 2.0, True)
+    settings = {"required": DEFAULT_REQUIRED_SKILLS, "min_years": 2.0, "weights": DEFAULT_WEIGHTS, "anonymize": True, "shortlist": 3}
+    add_saved_report(
+        state, "screening", "Data Scientist screening (sample)", build_report_html(results, settings),
+        {"resumes": len(results), "top_score": round(float(results[0]["score"]), 1) if results else 0},
+    )
+    sections = synthetic_fairness_sections(generate_synthetic_candidates(n=200, seed=42, bias_penalty=15))
+    add_saved_report(state, "audit", "Simulated audit, 15-point bias (sample)", build_audit_report_html(sections), audit_summary(sections))
+
+
+def demo_user_action(state, email: str, action: str) -> str:
+    """Pretend admin actions on the made-up sample accounts."""
+    users = state.setdefault("demo_users", [])
+    target = next((u for u in users if u["email"] == email), None)
+    if target is None:
+        return "Account not found."
+    if action == "Make administrator":
+        target["role"] = "admin"
+        return f"{email} is now an administrator (simulated)."
+    if action == "Make recruiter":
+        target["role"] = "recruiter"
+        return f"{email} is now a recruiter (simulated)."
+    if action == "Reset password":
+        return "A temporary password would be created and shown once (simulated). Nothing was changed."
+    if action == "Delete account":
+        users.remove(target)
+        return f"{email} was deleted (simulated)."
+    return "Unknown action."
+
+
+def sign_out(state) -> None:
+    """Forget the demo account and everything held in memory for this session."""
+    for key in list(state.keys()):
+        if key not in ("dark_mode", "intro_done"):
+            del state[key]
+
+
+# ---- screens ------------------------------------------------------------------------
 
 
 def _set_view(state, view: str) -> None:
     state["auth_view"] = view
 
 
-def sign_out(state) -> None:
-    """Forget the account and everything held in memory for this session."""
-    for key in list(state.keys()):
-        if key not in ("dark_mode", "intro_done"):
-            del state[key]
+def _start_session(state, email: str, role: str) -> None:
+    state["user"] = make_demo_user(email, role)
+    state["auth_view"] = "login"
+    seed_demo_data(state)
 
 
 def _show(st, text: str, tone: str = "bad", icon: str = "⛔") -> None:
     st.markdown(note_html(text, tone, icon), unsafe_allow_html=True)
 
 
-def _send_code_email(smtp_conf, user: Dict[str, object], conn, purpose: str) -> Optional[str]:
-    code = auth.issue_code(conn, int(user["id"]), purpose)
-    subject = "Your FairHire verification code" if purpose == "verify" else "Your FairHire password reset code"
-    body = f"Your FairHire code is {code}. It expires in {auth.CODE_TTL_SECONDS // 60} minutes. If you did not ask for it, ignore this email."
-    ok, error = auth.send_email(smtp_conf, str(user["email"]), subject, body)
-    return None if ok else error
-
-
-def render_auth(st, state, conn, smtp_conf, admin_email) -> None:  # pragma: no cover - UI
-    smtp_ok = auth.smtp_configured(smtp_conf)
+def render_auth(st, state) -> None:  # pragma: no cover - UI
     view = state.get("auth_view", "login")
     _, middle, _ = st.columns([1, 1.5, 1])
     with middle:
@@ -2082,103 +2267,84 @@ def render_auth(st, state, conn, smtp_conf, admin_email) -> None:  # pragma: no 
 
         if view == "signup":
             st.markdown(section_html("Create your account"), unsafe_allow_html=True)
-            if auth.count_users(conn) == 0 and not admin_email:
-                st.caption("The first account created becomes the administrator.")
-            with st.form("signup_form"):
-                email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
-                password = st.text_input("Password", type="password", placeholder="Password (10+ characters)", label_visibility="collapsed")
-                confirm = st.text_input("Confirm password", type="password", placeholder="Confirm password", label_visibility="collapsed")
-                submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
-            if not smtp_ok:
-                st.caption("Email verification is off because no email service is configured.")
-            if submitted:
-                if password != confirm:
-                    _show(st, "The two passwords do not match.")
-                else:
-                    user, error = auth.create_user(conn, email, password, verified=not smtp_ok, admin_email=admin_email)
-                    if error:
-                        _show(st, error)
-                    elif smtp_ok:
-                        problem = _send_code_email(smtp_conf, user, conn, "verify")
-                        state["pending_email"] = user["email"]
-                        state["auth_view"] = "verify"
-                        state["auth_flash"] = "We emailed you a 6-digit code." if not problem else f"{problem} Use 'Send a new code'."
-                        st.rerun()
-                    else:
-                        state["user"] = user
-                        state["auth_view"] = "login"
-                        st.rerun()
+            st.text_input("Full name", key="su_name", placeholder="Full name (optional)", label_visibility="collapsed")
+            email = st.text_input("Work email", key="su_email", placeholder="Work email", label_visibility="collapsed")
+            st.selectbox("I am a", ["Recruiter", "Administrator (demo)"], key="su_role")
+            password = st.text_input("Password", type="password", key="su_pw", placeholder="Password (10+ characters)", label_visibility="collapsed")
+            st.markdown(password_meter_html(password), unsafe_allow_html=True)
+            confirm = st.text_input("Confirm password", type="password", key="su_pw2", placeholder="Confirm password", label_visibility="collapsed")
+            agreed = st.checkbox("I understand this is a prototype and no real account is created.", key="su_terms")
+            if st.button("Create account", type="primary", use_container_width=True, key="su_submit"):
+                errors = prototype_signup_errors(email, password, confirm, agreed)
+                for message in errors:
+                    _show(st, message)
+                if not errors:
+                    role = "admin" if str(state.get("su_role", "")).startswith("Admin") else "recruiter"
+                    state["pending_user"] = {"email": email.strip().lower(), "role": role}
+                    state["auth_view"] = "verify"
+                    st.rerun()
             st.button("Already have an account? Sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
 
         elif view == "verify":
             st.markdown(section_html("Verify your email"), unsafe_allow_html=True)
-            pending = state.get("pending_email", "")
-            st.caption(f"Enter the 6-digit code we sent to {pending}.")
-            with st.form("verify_form"):
-                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
-                submitted = st.form_submit_button("Verify", type="primary", use_container_width=True)
-            if submitted:
-                user = auth.get_user_by_email(conn, pending)
-                if user and auth.check_code(conn, user["id"], "verify", code):
-                    auth.set_verified(conn, user["id"])
-                    state["auth_flash"] = "Email verified. You can sign in now."
-                    state["auth_view"] = "login"
-                    st.rerun()
-                else:
-                    _show(st, "That code is not valid or has expired.")
-            if st.button("Send a new code", use_container_width=True):
-                user = auth.get_user_by_email(conn, pending)
-                if user and not user["verified"]:
-                    problem = _send_code_email(smtp_conf, user, conn, "verify")
-                    _show(st, problem or "A new code is on its way.", "bad" if problem else "info", "✉️")
-            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+            pending = state.get("pending_user")
+            if not pending:
+                state["auth_view"] = "login"
+                st.rerun()
+            else:
+                st.caption(f"Simulated step: a real app would email a 6-digit code to {pending['email']}. Enter any 6 digits.")
+                with st.form("verify_form"):
+                    code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
+                    submitted = st.form_submit_button("Verify and continue", type="primary", use_container_width=True)
+                if submitted:
+                    if re.fullmatch(r"\d{6}", (code or "").strip()):
+                        state.pop("pending_user", None)
+                        _start_session(state, pending["email"], pending["role"])
+                        st.rerun()
+                    else:
+                        _show(st, "Enter 6 digits.")
+                if st.button("Resend code (simulated)", use_container_width=True):
+                    _show(st, "Prototype: no email was sent.", "info", "✉️")
+                st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
 
         elif view == "forgot":
             st.markdown(section_html("Reset your password"), unsafe_allow_html=True)
-            if not smtp_ok:
-                _show(
-                    st,
-                    "Password reset by email is not set up for this app. Ask an administrator to reset your password. "
-                    "They will give you a temporary one that you change at your next sign-in.",
-                    "info",
-                    "ℹ️",
-                )
-            else:
-                with st.form("forgot_form"):
-                    email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
-                    submitted = st.form_submit_button("Email me a code", type="primary", use_container_width=True)
-                if submitted:
-                    user = auth.get_user_by_email(conn, email)
-                    if user:
-                        _send_code_email(smtp_conf, user, conn, "reset")
-                    state["pending_email"] = auth.normalize_email(email)
-                    state["auth_flash"] = "If that email has an account, a code has been sent."
-                    state["auth_view"] = "reset"
+            with st.form("forgot_form"):
+                email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                submitted = st.form_submit_button("Email me a reset link", type="primary", use_container_width=True)
+            if submitted:
+                if simple_email_ok(email):
+                    state["pending_email"] = email.strip().lower()
+                    state["auth_view"] = "forgot_sent"
                     st.rerun()
+                else:
+                    _show(st, "Enter a valid email address.")
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "forgot_sent":
+            st.markdown(section_html("Check your inbox"), unsafe_allow_html=True)
+            _show(
+                st,
+                f"Simulated: if this were live, a reset link would be emailed to {state.get('pending_email', 'you')}. Nothing was sent.",
+                "info",
+                "✉️",
+            )
+            st.button("Preview the reset screen", on_click=_set_view, args=(state, "reset"), use_container_width=True)
             st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
 
         elif view == "reset":
             st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
-            with st.form("reset_form"):
-                email = st.text_input("Email address", value=state.get("pending_email", ""), placeholder="Email address", label_visibility="collapsed")
-                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
-                password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
-                confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
-                submitted = st.form_submit_button("Update password", type="primary", use_container_width=True)
-            if submitted:
-                user = auth.get_user_by_email(conn, email)
-                if password != confirm:
-                    _show(st, "The two passwords do not match.")
-                elif not (user and auth.check_code(conn, user["id"], "reset", code)):
-                    _show(st, "That code is not valid or has expired.")
-                else:
-                    problem = auth.set_password(conn, user["id"], password)
-                    if problem:
-                        _show(st, problem)
-                    else:
-                        state["auth_flash"] = "Password updated. You can sign in now."
-                        state["auth_view"] = "login"
-                        st.rerun()
+            password = st.text_input("New password", type="password", key="rs_pw", placeholder="New password (10+ characters)", label_visibility="collapsed")
+            st.markdown(password_meter_html(password), unsafe_allow_html=True)
+            confirm = st.text_input("Confirm new password", type="password", key="rs_pw2", placeholder="Confirm new password", label_visibility="collapsed")
+            if st.button("Update password", type="primary", use_container_width=True, key="rs_submit"):
+                errors = prototype_password_errors(password, confirm)
+                for message in errors:
+                    _show(st, message)
+                if not errors:
+                    state["auth_flash"] = "Password updated (simulated). Sign in to continue."
+                    state["auth_view"] = "login"
+                    st.rerun()
             st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
 
         else:
@@ -2188,59 +2354,35 @@ def render_auth(st, state, conn, smtp_conf, admin_email) -> None:  # pragma: no 
                 password = st.text_input("Password", type="password", placeholder="Password", label_visibility="collapsed")
                 submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
             if submitted:
-                user, error = auth.authenticate(conn, email, password)
-                if error:
-                    _show(st, error)
-                else:
-                    state["user"] = user
+                errors = prototype_signin_errors(email, password)
+                for message in errors:
+                    _show(st, message)
+                if not errors:
+                    _start_session(state, email, role_for_email(email))
                     st.rerun()
+            st.caption("Prototype tip: any valid-looking email and password works. Start the email with 'admin' to see the administrator view.")
             st.button("New to FairHire? Create an account", on_click=_set_view, args=(state, "signup"), use_container_width=True)
             st.button("Forgot your password?", on_click=_set_view, args=(state, "forgot"), use_container_width=True)
-        st.caption("Resumes you upload are processed in memory and are never saved.")
+            st.button("Try the demo as a recruiter", on_click=_start_session, args=(state, "demo.recruiter@example.com", "recruiter"), use_container_width=True)
+            st.button("Try the demo as an administrator", on_click=_start_session, args=(state, "admin.demo@example.com", "admin"), use_container_width=True)
+        st.caption(PROTOTYPE_FOOTNOTE)
 
 
-def render_must_change(st, state, conn, user) -> None:  # pragma: no cover - UI
-    _, middle, _ = st.columns([1, 1.5, 1])
-    with middle:
-        st.markdown('<div class="fh-card-marker"></div>' + auth_brand_html(), unsafe_allow_html=True)
-        st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
-        st.caption("An administrator gave you a temporary password. Set your own to continue.")
-        with st.form("must_change_form"):
-            current = st.text_input("Temporary password", type="password", placeholder="Temporary password", label_visibility="collapsed")
-            password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
-            confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
-            submitted = st.form_submit_button("Save password", type="primary", use_container_width=True)
-        if submitted:
-            if password != confirm:
-                _show(st, "The two passwords do not match.")
-            else:
-                problem = auth.change_password(conn, user["id"], current, password)
-                if problem:
-                    _show(st, problem)
-                else:
-                    state["user"] = auth.get_user(conn, user["id"])
-                    st.rerun()
-        st.button("Sign out", on_click=sign_out, args=(state,), use_container_width=True)
-
-
-def render_dashboard(st, state, conn, user) -> None:  # pragma: no cover - UI
-    uid = int(user["id"])
-    jobs = auth.list_jobs(conn, uid)
-    reports = auth.list_reports(conn, uid, "screening")
-    audits = auth.list_reports(conn, uid, "audit")
+def render_dashboard(st, state, user) -> None:  # pragma: no cover - UI
+    jobs = list(reversed(state.get("saved_jobs", [])))
+    reports = [r for r in reversed(state.get("saved_reports", [])) if r["kind"] == "screening"]
+    audits = [r for r in reversed(state.get("saved_reports", [])) if r["kind"] == "audit"]
     st.markdown(section_html("Your dashboard"), unsafe_allow_html=True)
     st.markdown(
         kpis_html([kpi_card("Saved jobs", len(jobs)), kpi_card("Saved reports", len(reports)), kpi_card("Fairness audits", len(audits))]),
         unsafe_allow_html=True,
     )
-    st.markdown(
-        note_html(
-            "Private to your account. Resumes are never saved. Saved reports hold candidate numbers, scores, explanations and "
-            "short evidence snippets for proxy flags. On Streamlit Community Cloud, saved data can disappear when the app restarts.",
-            "info",
-            "🔒",
-        ),
-        unsafe_allow_html=True,
+    _show(
+        st,
+        "Prototype: items marked (sample) are made up. Anything you save is kept only in this browser tab and disappears when you "
+        "close it or sign out. Resumes are never saved.",
+        "info",
+        "🧪",
     )
     note = state.pop("dash_flash", None)
     if note:
@@ -2253,90 +2395,68 @@ def render_dashboard(st, state, conn, user) -> None:  # pragma: no cover - UI
         c1, c2, c3 = st.columns([5, 1, 1])
         c1.markdown(f'<b>{_esc(job["title"])}</b><div class="fh-muted">{_esc(job["created_at"])}</div>', unsafe_allow_html=True)
         if c2.button("Load", key=f"load_job_{job['id']}"):
-            full = auth.get_job(conn, uid, job["id"])
-            if full:
-                apply_job_to_state(state, full)
-                state["dash_flash"] = f"Loaded '{full['title']}'. Open the Screening tab to continue."
-                st.rerun()
+            apply_job_to_state(state, job)
+            state["dash_flash"] = f"Loaded '{job['title']}'. Open the Screening tab to continue."
+            st.rerun()
         if c3.button("Delete", key=f"del_job_{job['id']}"):
-            auth.delete_job(conn, uid, job["id"])
+            delete_saved(state, "saved_jobs", job["id"])
             st.rerun()
 
-    for heading, kind, items in (("Saved reports", "screening", reports), ("Previous fairness audits", "audit", audits)):
+    for heading, items in (("Saved reports", reports), ("Previous fairness audits", audits)):
         st.markdown(section_html(heading), unsafe_allow_html=True)
         if not items:
             st.markdown(empty_state_html("Nothing saved yet", "Save one from the Review & report or Fairness audit tab.", "📁"), unsafe_allow_html=True)
         for item in items:
             c1, c2, c3 = st.columns([5, 1.4, 1])
             c1.markdown(
-                f'<b>{_esc(item["title"])}</b><div class="fh-muted">{_esc(item["created_at"])} | {_esc(describe_summary(kind, item["summary"]))}</div>',
+                f'<b>{_esc(item["title"])}</b><div class="fh-muted">{_esc(item["created_at"])} | '
+                f'{_esc(describe_summary(item["kind"], item["summary"]))}</div>',
                 unsafe_allow_html=True,
             )
-            html_text = auth.get_report_html(conn, uid, item["id"]) or ""
             c2.download_button(
-                "Download", data=html_text.encode("utf-8"), file_name=f"fairhire_{kind}_{item['id']}.html",
-                mime="text/html", key=f"dl_{kind}_{item['id']}",
+                "Download", data=str(item["html"]).encode("utf-8"), file_name=f"fairhire_{item['kind']}_{item['id']}.html",
+                mime="text/html", key=f"dl_{item['id']}",
             )
-            if c3.button("Delete", key=f"del_{kind}_{item['id']}"):
-                auth.delete_report(conn, uid, item["id"])
+            if c3.button("Delete", key=f"del_rep_{item['id']}"):
+                delete_saved(state, "saved_reports", item["id"])
                 st.rerun()
 
 
-def render_admin(st, state, conn, user) -> None:  # pragma: no cover - UI
+def render_admin(st, state, user) -> None:  # pragma: no cover - UI
     st.markdown(section_html("Administration"), unsafe_allow_html=True)
-    try:
-        users = auth.list_users(conn, int(user["id"]))
-    except PermissionError:
-        _show(st, "Administrator access is required.")
-        return
-    st.markdown(
-        note_html(
-            "You can manage accounts. You cannot see anyone's jobs, reports or resumes, only how many each person has.",
-            "info",
-            "🛡️",
-        ),
-        unsafe_allow_html=True,
+    _show(
+        st,
+        "Prototype: these accounts are made up. In the real version an administrator could manage accounts but not read anyone's "
+        "saved data, only how many items each person has.",
+        "info",
+        "🛡️",
     )
+    note = state.pop("admin_flash", None)
+    if note:
+        _show(st, note, "info", "✅")
+    yours = {
+        "id": 0, "email": user["email"], "role": user["role"], "verified": True,
+        "jobs": len(state.get("saved_jobs", [])), "reports": len(state.get("saved_reports", [])), "created": str(user["created_at"])[:10],
+    }
+    users = [yours] + list(state.get("demo_users", []))
     table = pd.DataFrame(
         [
-            {"Email": u["email"], "Role": u["role"], "Verified": "yes" if u["verified"] else "no",
-             "Jobs": u["jobs"], "Reports": u["reports"], "Created": u["created_at"]}
+            {"Email": u["email"] + (" (you)" if u["id"] == 0 else ""), "Role": u["role"], "Verified": "yes" if u["verified"] else "no",
+             "Jobs": u["jobs"], "Reports": u["reports"], "Created": u["created"]}
             for u in users
         ]
     )
     st.markdown(df_table_html(table, 200), unsafe_allow_html=True)
-    others = [u for u in users if u["id"] != user["id"]]
+    others = list(state.get("demo_users", []))
     if not others:
-        st.caption("No other accounts yet.")
+        st.caption("No other sample accounts left.")
         return
     labels = [f"{u['email']} ({u['role']})" for u in others]
     choice = st.selectbox("Account", labels, key="admin_target")
     action = st.selectbox("Action", ["Make administrator", "Make recruiter", "Reset password", "Delete account"], key="admin_action")
-    confirm = st.checkbox("I understand this cannot be undone", key="admin_confirm")
-    if st.button("Apply", type="primary", key="admin_apply"):
-        target = others[labels.index(choice)]
-        if action in ("Reset password", "Delete account") and not confirm:
-            _show(st, "Tick the box to confirm.")
-        elif action == "Make administrator":
-            problem = auth.set_role(conn, user["id"], target["id"], "admin")
-            _show(st, problem or "Role updated.", "bad" if problem else "info", "✅")
-        elif action == "Make recruiter":
-            problem = auth.set_role(conn, user["id"], target["id"], "recruiter")
-            _show(st, problem or "Role updated.", "bad" if problem else "info", "✅")
-        elif action == "Reset password":
-            temporary, problem = auth.admin_reset_password(conn, user["id"], target["id"])
-            if problem:
-                _show(st, problem)
-            else:
-                _show(st, "Temporary password created. Share it with the user privately. They must change it when they sign in. It is shown only now.", "info", "🔑")
-                st.code(temporary)
-        else:
-            problem = auth.delete_user(conn, user["id"], target["id"])
-            if problem:
-                _show(st, problem)
-            else:
-                state["dash_flash"] = "Account deleted."
-                st.rerun()
+    if st.button("Apply (simulated)", type="primary", key="admin_apply"):
+        state["admin_flash"] = demo_user_action(state, others[labels.index(choice)]["email"], action)
+        st.rerun()
 
 
 def main() -> None:  # pragma: no cover - exercised only inside Streamlit
@@ -2354,15 +2474,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     for key, value in defaults.items():
         state.setdefault(key, value)
 
-    conn = auth.open_db()
-    smtp_conf, admin_email = read_app_secrets(st)
-    user = state.get("user")
-    if user:  # re-read every run so role changes and deleted accounts take effect immediately
-        user = auth.get_user(conn, user["id"])
-        if user is None:
-            sign_out(state)
-        else:
-            state["user"] = user
+    user = state.get("user")  # a simulated account that lives only in this browser session
 
     top_left, top_right = st.columns([6, 1.3])
     with top_right:
@@ -2389,14 +2501,12 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         state["intro_done"] = True
 
     if not user:
-        render_auth(st, state, conn, smtp_conf, admin_email)
-        return
-    if user["must_change"]:
-        render_must_change(st, state, conn, user)
+        render_auth(st, state)
         return
     flash = state.pop("flash", None)
     if flash:
         st.markdown(note_html(flash[1], flash[0], "✅" if flash[0] == "info" else "⛔"), unsafe_allow_html=True)
+    st.markdown(note_html(PROTOTYPE_BANNER, "info", "🧪"), unsafe_allow_html=True)
 
     is_admin = user["role"] == "admin"
     tab_names = ["🏠 Dashboard", "📄 Screening", "📝 Review & report", "🧪 Bias stress test", "📊 Fairness audit", "📘 Methodology"]
@@ -2407,7 +2517,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     tab_admin = tabs[6] if is_admin else None
 
     with tab_dash:
-        render_dashboard(st, state, conn, user)
+        render_dashboard(st, state, user)
 
     results: List[Dict[str, object]] = []
     config: Dict[str, object] = {}
@@ -2461,10 +2571,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             with st.expander("💾 Save this job to my dashboard"):
                 st.text_input("Job title", key="job_title", placeholder="e.g. Data Scientist, Q4")
                 if st.button("Save job", key="save_job_btn"):
-                    _job_id, problem = auth.save_job(
-                        conn, user["id"], state["job_title"], state["jd_text"], job_settings_from_state(state)
-                    )
-                    state["flash"] = ("bad", problem) if problem else ("info", "Job saved to your dashboard.")
+                    problem = add_saved_job(state, state["job_title"], state["jd_text"], job_settings_from_state(state))
+                    state["flash"] = ("bad", problem) if problem else ("info", "Job saved to your dashboard (this browser tab only).")
                     st.rerun()
             st.checkbox("Anonymize resumes before scoring", key="anonymize")
             st.checkbox("Show file names in results", key="reveal_files")
@@ -2640,11 +2748,10 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             st.markdown(section_html("Save this audit"), unsafe_allow_html=True)
             st.text_input("Audit title", key="audit_title", placeholder="e.g. Q4 audit, 15-point simulated bias")
             if st.button("💾 Save audit to my dashboard", key="save_audit_btn"):
-                _aid, problem = auth.save_report(
-                    conn, user["id"], state["audit_title"], "audit",
-                    build_audit_report_html(audit_sections), audit_summary(audit_sections),
+                problem = add_saved_report(
+                    state, "audit", state["audit_title"], build_audit_report_html(audit_sections), audit_summary(audit_sections)
                 )
-                state["flash"] = ("bad", problem) if problem else ("info", "Audit saved to your dashboard.")
+                state["flash"] = ("bad", problem) if problem else ("info", "Audit saved to your dashboard (this browser tab only).")
                 st.rerun()
 
     # ------------------------------------------------------------------ Review & report tab
@@ -2742,8 +2849,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                     "top_score": round(float(results[0]["score"]), 1),
                     "decisions": len(state["review_log"]),
                 }
-                _rid, problem = auth.save_report(conn, user["id"], state["report_title"], "screening", saved_html, summary)
-                state["flash"] = ("bad", problem) if problem else ("info", "Report saved to your dashboard.")
+                problem = add_saved_report(state, "screening", state["report_title"], saved_html, summary)
+                state["flash"] = ("bad", problem) if problem else ("info", "Report saved to your dashboard (this browser tab only).")
                 st.rerun()
 
     # ------------------------------------------------------------------ Bias stress test tab
@@ -2796,7 +2903,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
 
     if tab_admin is not None:
         with tab_admin:
-            render_admin(st, state, conn, user)
+            render_admin(st, state, user)
 
     st.markdown(
         '<div class="fh-footer">FairHire is decision support, not a decision maker. A human reviews every outcome.</div>',
