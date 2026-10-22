@@ -13,6 +13,40 @@ import unittest
 import app  # must NOT launch the Streamlit interface on import
 
 
+def make_pdf(pages):
+    """Build a small text PDF, one string per page (no external libraries)."""
+
+    def esc(line):
+        return line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    count = len(pages)
+    kids = " ".join(f"{4 + 2 * i} 0 R" for i in range(count))
+    objects = ["<< /Type /Catalog /Pages 2 0 R >>", f"<< /Type /Pages /Kids [{kids}] /Count {count} >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    for i, text in enumerate(pages):
+        stream = "BT /F1 11 Tf 14 TL 50 740 Td " + " ".join(f"({esc(line)}) Tj T*" for line in text.split("\n")) + " ET"
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {5 + 2 * i} 0 R /Resources << /Font << /F1 3 0 R >> >> >>"
+        )
+        objects.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return out
+
+
+R1_P1 = "Priya Sharma\npriya.sharma@example.com | +91 98765 43210\nSummary\n5 years of experience building machine learning models.\nSkills: Python, SQL, pandas"
+R1_P2 = "Experience\n2019 - 2024 Data Scientist at Example Analytics\nBuilt dashboards with Tableau"
+R2_P1 = "Rahul Verma\nrahul.v@example.org\nExperience\nBackend developer, 3 years of experience in Java and SQL"
+R3_P1 = "Sneha Iyer\nSenior ML engineer\nSkills\nPython, PyTorch, NLP, deep learning, AWS\n8 years of experience"
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_import_does_not_load_streamlit(self):
         self.assertNotIn("streamlit", sys.modules, "importing app must not start/import Streamlit")
@@ -525,8 +559,10 @@ class StressTestTests(unittest.TestCase):
             self.assertGreaterEqual(len(result["rows"]), 6)
 
     def test_detects_a_name_that_leaks_into_scoring(self):
-        leaky = "Python Smith\nWrites SQL daily."
-        result = app.bias_stress_test(leaky, ["python", "sql"], "", 0)
+        # the candidate's name happens to be a job-description keyword, so changing it changes the score
+        leaky = "Dashboard Rao\nWrites SQL daily."
+        result = app.bias_stress_test(leaky, [], "dashboard reporting metrics", 0)
+        self.assertTrue(result["name_detected"])
         self.assertFalse(result["passed"])
         self.assertGreater(result["max_abs_delta"], 0)
 
@@ -758,6 +794,188 @@ class PrototypeAccountTests(unittest.TestCase):
         self.assertEqual(app.demo_user_action(state, email, "Delete account"), "Account not found.")
         self.assertEqual(app.demo_user_action(state, state["demo_users"][0]["email"], "Explode"), "Unknown action.")
         self.assertTrue(all(u["email"].endswith("@example.com") for u in app.SAMPLE_USERS))
+
+
+class RealResumeIngestTests(unittest.TestCase):
+    def test_helper_pdf_is_readable(self):
+        pages = app.read_pdf_pages(make_pdf([R1_P1, R1_P2]))
+        self.assertEqual(len(pages), 2)
+        self.assertIn("priya.sharma@example.com", pages[0])
+        self.assertIn("Tableau", pages[1])
+
+    def test_clean_extracted_text(self):
+        raw = "Pro\ufb01cient  in\u00a0Python\u200b \n\n\n\n  Next   line \x00"
+        cleaned = app.clean_extracted_text(raw)
+        self.assertEqual(cleaned, "Proficient in Python\n\nNext line")
+        self.assertEqual(app.clean_extracted_text(None), "")
+
+    def test_auto_split_finds_each_resume(self):
+        pages = [R1_P1, R1_P2, R2_P1, R3_P1]
+        self.assertEqual(app.detect_resume_starts(pages), [0, 2, 3])
+        self.assertEqual(app.split_pdf_pages(pages, "auto"), [(0, 1), (2, 2), (3, 3)])
+
+    def test_running_header_does_not_split_a_resume(self):
+        page2 = "priya.sharma@example.com\n" + R1_P2
+        self.assertEqual(app.detect_resume_starts([R1_P1, page2, R2_P1]), [0, 2])
+
+    def test_same_phone_on_every_page_stays_together(self):
+        page2 = "Priya Sharma | +91 98765 43210\nExperience\nMore work"
+        self.assertEqual(app.detect_resume_starts([R1_P1, page2]), [0])
+
+    def test_dates_are_not_mistaken_for_phone_numbers(self):
+        self.assertEqual(app._page_identities("Experience\n2018 - 2022 2023 2024"), set())
+
+    def test_split_modes(self):
+        pages = [R1_P1, R1_P2, "", R2_P1]
+        self.assertEqual(app.split_pdf_pages(pages, "single"), [(0, 3)])
+        self.assertEqual(app.split_pdf_pages(pages, "per_page"), [(0, 0), (1, 1), (3, 3)])
+        self.assertEqual(app.split_pdf_pages([], "auto"), [])
+        self.assertEqual(app.detect_resume_starts([]), [])
+
+    def test_ingest_multi_resume_pdf(self):
+        pdf = make_pdf([R1_P1, R1_P2, R2_P1, R3_P1])
+        documents, rows, problems = app.ingest_uploads([("batch.pdf", pdf)], "auto")
+        self.assertEqual(problems, [])
+        self.assertEqual([d[0] for d in documents], ["batch.pdf (pages 1-2)", "batch.pdf (page 3)", "batch.pdf (page 4)"])
+        self.assertIn("Tableau", documents[0][1])
+        self.assertEqual((rows[0]["pages"], rows[0]["resumes"], rows[0]["detail"]), (4, 3, "1-2, 3, 4"))
+        single, rows, _ = app.ingest_uploads([("batch.pdf", pdf)], "single")
+        self.assertEqual((len(single), single[0][0]), (1, "batch.pdf"))
+        per_page, _, _ = app.ingest_uploads([("batch.pdf", pdf)], "per_page")
+        self.assertEqual(len(per_page), 4)
+        self.assertEqual(len(app.ingest_uploads([("batch.pdf", pdf)], "nonsense")[0]), 3)  # falls back to auto
+
+    def test_ingest_mixed_files_and_problems(self):
+        good_pdf = make_pdf([R2_P1])
+        files = [
+            ("one.pdf", good_pdf),
+            ("notes.txt", b"Python developer with SQL"),
+            ("empty.txt", b""),
+            ("bad.pdf", b"not a pdf"),
+            ("virus.exe", b"abc"),
+            ("huge.pdf", b"a" * (app.MAX_FILE_BYTES + 1)),
+        ]
+        documents, rows, problems = app.ingest_uploads(files, "auto")
+        self.assertEqual([d[0] for d in documents], ["one.pdf", "notes.txt"])
+        self.assertEqual(len(problems), 4)
+        self.assertEqual({r["file"]: r["status"] for r in rows}["bad.pdf"], "Skipped")
+        self.assertEqual(sum(1 for r in rows if r["status"] == "Read"), 2)
+
+    def test_scanned_pdf_gives_a_clear_message(self):
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        documents, rows, problems = app.ingest_uploads([("scan.pdf", buffer.getvalue())], "auto")
+        self.assertEqual(documents, [])
+        self.assertIn("scanned images are not supported", problems[0])
+        self.assertEqual(rows[0]["status"], "Skipped")
+
+    def test_page_and_resume_limits(self):
+        old = app.MAX_RESUMES_PER_RUN
+        app.MAX_RESUMES_PER_RUN = 2
+        try:
+            docs, _, problems = app.ingest_uploads([("a.txt", b"Python"), ("b.txt", b"SQL"), ("c.txt", b"Java")], "auto")
+        finally:
+            app.MAX_RESUMES_PER_RUN = old
+        self.assertEqual(len(docs), 2)
+        self.assertTrue(any("Only the first 2" in p for p in problems))
+        old_pages = app.MAX_PDF_PAGES
+        app.MAX_PDF_PAGES = 1
+        try:
+            docs, _, problems = app.ingest_uploads([("long.pdf", make_pdf([R1_P1, R1_P2]))], "auto")
+        finally:
+            app.MAX_PDF_PAGES = old_pages
+        self.assertEqual(docs, [])
+        self.assertIn("more than 1 pages", problems[0])
+
+    def test_blank_pages_in_per_page_mode_are_reported(self):
+        docs, _, problems = app.ingest_uploads([("x.pdf", make_pdf([R1_P1, " ", R2_P1]))], "per_page")
+        self.assertEqual(len(docs), 2)
+        self.assertTrue(any("blank page" in p for p in problems))
+
+    def test_end_to_end_screening_of_one_multi_resume_pdf(self):
+        documents, _, _ = app.ingest_uploads([("batch.pdf", make_pdf([R1_P1, R1_P2, R2_P1, R3_P1]))], "auto")
+        results, warnings = app.screen_resumes(documents, ["python", "sql", "machine learning"], "", 3)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0]["file_name"], "batch.pdf (pages 1-2)")  # the Python + SQL + ML resume wins
+        self.assertTrue(all("@example" not in r["text_used"] for r in results))
+        self.assertTrue(all("[NAME]" in r["text_used"] for r in results))
+
+    def test_ingest_report_html(self):
+        rows = [
+            {"file": "<b>x</b>.pdf", "kind": "PDF", "pages": 4, "resumes": 3, "detail": "1-2, 3, 4", "status": "Read"},
+            {"file": "bad.pdf", "kind": "PDF", "pages": "-", "resumes": 0, "detail": "", "status": "Skipped"},
+        ]
+        out = app.ingest_report_html(rows)
+        self.assertIn("3 resume(s) from 2 file(s)", out)
+        self.assertNotIn("<b>x</b>", out)
+        self.assertNotIn("\n", out)
+        self.assertIn(" open>", out)  # multi-resume file: shown expanded
+        self.assertNotIn(" open>", app.ingest_report_html([dict(rows[0], resumes=1)]))
+        self.assertEqual(app.ingest_report_html([]), "")
+
+
+class BlindReviewCardTests(unittest.TestCase):
+    def setUp(self):
+        text = "Priya Sharma\npriya.sharma@example.com\nPython and SQL, 5 years of experience."
+        self.item = app.screen_resumes([("f.txt", text)], ["python"], "", 0)[0][0]
+
+    def test_default_card_never_contains_the_original_identity(self):
+        out = app.candidate_card_html(self.item)
+        for secret in ("Priya", "Sharma", "priya.sharma@example.com"):
+            self.assertNotIn(secret, out)
+        self.assertIn("Text used for scoring", out)
+        self.assertIn("[NAME]", out)
+        self.assertNotIn('class="fh-del"', out)
+
+    def test_original_is_shown_only_on_request(self):
+        out = app.candidate_card_html(self.item, show_original=True)
+        self.assertIn("Priya", out)
+        self.assertIn('class="fh-del"', out)
+        self.assertIn("Before / after anonymization", out)
+
+    def test_card_is_safe_and_markdown_proof(self):
+        for flag in (False, True):
+            out = app.candidate_card_html(self.item, show_original=flag)
+            self.assertNotIn("\n", out)
+            self.assertNotIn("<script", out)
+
+
+class RealNameHandlingTests(unittest.TestCase):
+    def test_is_name_line(self):
+        for good in ["Priya Sharma", "PRIYA SHARMA", "John A. Smith", "Maria de la Cruz", "Anne-Marie O'Neil"]:
+            self.assertTrue(app._is_name_line(good), good)
+        for bad in ["Python Developer", "Software Engineering", "Work Experience", "Machine Learning", "Skills", "",
+                    "Aarav", "jane doe", "Data Scientist at Example Analytics Pvt Ltd"]:
+            self.assertFalse(app._is_name_line(bad), bad)
+
+    def test_name_is_found_below_a_title_line_and_masked_everywhere(self):
+        text = "Curriculum Vitae\nPriya Sharma\npriya@example.com\nPriya has 5 years of experience. Ms. Sharma led a team. Priyanka is a friend."
+        out = app.anonymize_text(text)
+        self.assertNotIn("Priya Sharma", out)
+        self.assertNotIn("Sharma", out)
+        self.assertNotIn("Priya ", out)
+        self.assertIn("Priyanka", out)  # a different word is left alone
+        self.assertTrue(out.startswith("Curriculum Vitae"))
+
+    def test_name_label_value_is_masked_in_the_body_too(self):
+        out = app.anonymize_text("Name: Rahul Verma\nBackend developer. Rahul built APIs.")
+        self.assertNotIn("Rahul", out)
+        self.assertNotIn("Verma", out)
+
+    def test_name_parts_that_are_skills_or_titles_are_not_masked(self):
+        tokens = app._name_tokens("Python Manager Smith")
+        self.assertIn("Smith", tokens)
+        self.assertNotIn("Python", tokens)
+        self.assertNotIn("Manager", tokens)
+
+    def test_detect_name_scans_the_first_lines(self):
+        self.assertEqual(app.detect_name("Resume\nPriya Sharma\nSkills"), "Priya Sharma")
+        self.assertIsNone(app.detect_name("Skills\nPython and SQL"))
 
 
 if __name__ == "__main__":
