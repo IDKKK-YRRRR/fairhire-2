@@ -22,8 +22,9 @@ import json
 import math
 import random
 import re
+import unicodedata
 from datetime import date, datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -31,7 +32,7 @@ import pandas as pd
 # Configuration
 # --------------------------------------------------------------------------------------
 
-MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB per resume
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB per file (a PDF may hold many resumes)
 SUPPORTED_EXTENSIONS = (".txt", ".pdf", ".docx")
 
 # Scoring weights (points out of 100). Components that cannot be evaluated because the
@@ -185,16 +186,45 @@ def csv_safe(value):
 # --------------------------------------------------------------------------------------
 
 
+SPLIT_MODES = {
+    "Detect automatically": "auto",
+    "One resume per page": "per_page",
+    "Treat each PDF as one resume": "single",
+}
+MAX_PDF_PAGES = 400
+MAX_RESUMES_PER_RUN = 300
+MAX_DETAIL_CARDS = 25
+MAX_REVIEW_ITEMS = 50
+MAX_STRESS_ITEMS = 100
+
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u00ad"), None)
+
+
+def clean_extracted_text(text: str) -> str:
+    """Tidy text pulled out of PDFs and Word files (ligatures, odd spaces, runs of blank lines)."""
+    text = unicodedata.normalize("NFKC", text or "").translate(_ZERO_WIDTH).replace("\x00", " ")
+    lines = [re.sub(r"[ \t\f\v]+", " ", line).strip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _precheck(filename: str, data: bytes) -> Optional[str]:
+    name = (filename or "").strip()
+    if not data:
+        return f"'{name}' is empty (0 bytes)."
+    if len(data) > MAX_FILE_BYTES:
+        return f"'{name}' is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB and was skipped."
+    if not name.lower().endswith(SUPPORTED_EXTENSIONS):
+        return f"'{name}' has an unsupported type. Please upload TXT, PDF or DOCX files."
+    return None
+
+
 def read_resume_bytes(filename: str, data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """Return ``(text, error)``. Exactly one of the two is ``None``."""
+    """Return ``(text, error)`` for one file, treating it as a single resume. Exactly one is ``None``."""
     name = (filename or "").strip()
     lower = name.lower()
-    if not data:
-        return None, f"'{name}' is empty (0 bytes)."
-    if len(data) > MAX_FILE_BYTES:
-        return None, f"'{name}' is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB and was skipped."
-    if not lower.endswith(SUPPORTED_EXTENSIONS):
-        return None, f"'{name}' has an unsupported type. Please upload TXT, PDF or DOCX files."
+    problem = _precheck(name, data)
+    if problem:
+        return None, problem
 
     try:
         if lower.endswith(".txt"):
@@ -215,13 +245,14 @@ def read_resume_bytes(filename: str, data: bytes) -> Tuple[Optional[str], Option
     except Exception as exc:  # noqa: BLE001 - surface any parser failure to the user
         return None, f"'{name}' could not be read ({type(exc).__name__}). The file may be corrupted or password-protected."
 
-    text = text.replace("\x00", " ").strip()
+    text = clean_extracted_text(text)
     if not text:
         return None, f"'{name}' contains no extractable text (scanned images are not supported)."
     return text, None
 
 
-def _read_pdf(data: bytes) -> str:
+def read_pdf_pages(data: bytes) -> List[str]:
+    """Text of every page of a PDF (cleaned). Raises ``ValueError`` with a readable reason."""
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))
@@ -229,8 +260,14 @@ def _read_pdf(data: bytes) -> str:
         try:
             reader.decrypt("")
         except Exception as exc:  # noqa: BLE001
-            raise ValueError("encrypted PDF") from exc
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+            raise ValueError("the PDF is password-protected") from exc
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError(f"the PDF has more than {MAX_PDF_PAGES} pages")
+    return [clean_extracted_text(page.extract_text() or "") for page in reader.pages]
+
+
+def _read_pdf(data: bytes) -> str:
+    return "\n".join(read_pdf_pages(data))
 
 
 def _read_docx(data: bytes) -> str:
@@ -243,6 +280,182 @@ def _read_docx(data: bytes) -> str:
             for cell in row.cells:
                 parts.append(cell.text)
     return "\n".join(parts)
+
+
+# ---- several resumes in one PDF -------------------------------------------------------
+
+_EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+_SECTION_LINE_RE = re.compile(
+    r"^(?:professional\s+|work\s+)?(?:summary|objective|profile|experience|education|skills|projects|certifications|achievements)\b",
+    re.IGNORECASE,
+)
+
+
+def _head_lines(page: str, count: int = 14) -> List[str]:
+    return [line.strip() for line in (page or "").splitlines() if line.strip()][:count]
+
+
+def _page_identities(page: str) -> Set[str]:
+    """Emails and phone numbers near the top of the page, used to tell resumes apart."""
+    head = "\n".join(_head_lines(page))
+    found = {"email:" + m.group(0).lower() for m in _EMAIL_FIND.finditer(head)}
+    for phone in _PHONE_RE.finditer(head):
+        digits = re.sub(r"\D", "", phone.group(0))
+        groups = re.findall(r"\d+", phone.group(0))
+        if 10 <= len(digits) <= 15 and not all(len(g) == 4 and 1900 <= int(g) <= 2100 for g in groups):
+            found.add("phone:" + digits[-10:])
+    return found
+
+
+def _looks_like_resume_start(page: str) -> bool:
+    """A name-like line at the top plus a typical section heading near the top."""
+    lines = _head_lines(page, 12)
+    return bool(lines) and any(_is_name_line(ln) for ln in lines[:3]) and any(_SECTION_LINE_RE.match(ln) for ln in lines)
+
+
+def detect_resume_starts(pages: Sequence[str]) -> List[int]:
+    """Indexes of the pages that begin a new resume.
+
+    A page starts a new resume when none of its contact details match the current resume's,
+    or when it has no contact details but opens with a name and a section heading.
+    Continuation pages and running headers that repeat any of the same contact details stay together.
+    """
+    if not pages:
+        return []
+    starts = [0]
+    current = _page_identities(pages[0])
+    for index in range(1, len(pages)):
+        identities = _page_identities(pages[index])
+        if identities:
+            if not current:
+                if _looks_like_resume_start(pages[index]):
+                    starts.append(index)
+                current = set(identities)
+            elif identities & current:
+                current |= identities
+            else:
+                starts.append(index)
+                current = set(identities)
+        elif _looks_like_resume_start(pages[index]):
+            starts.append(index)
+            current = set()
+    return starts
+
+
+def split_pdf_pages(pages: Sequence[str], mode: str = "auto") -> List[Tuple[int, int]]:
+    """Inclusive (first, last) page indexes of each resume in the PDF."""
+    count = len(pages)
+    if count == 0:
+        return []
+    if mode == "single":
+        return [(0, count - 1)]
+    if mode == "per_page":
+        return [(i, i) for i in range(count) if pages[i].strip()]
+    starts = detect_resume_starts(pages)
+    return [(start, (starts[k + 1] - 1 if k + 1 < len(starts) else count - 1)) for k, start in enumerate(starts)]
+
+
+def _range_text(first: int, last: int) -> str:
+    return str(first) if first == last else f"{first}-{last}"
+
+
+def ingest_uploads(
+    files: Sequence[Tuple[str, bytes]], split_mode: str = "auto"
+) -> Tuple[List[Tuple[str, str]], List[Dict[str, object]], List[str]]:
+    """Turn uploaded files into ``(label, text)`` resumes.
+
+    Returns ``(documents, report_rows, problems)``. A PDF holding several resumes becomes
+    several documents labelled with their page ranges.
+    """
+    mode = split_mode if split_mode in ("auto", "per_page", "single") else "auto"
+    documents: List[Tuple[str, str]] = []
+    rows: List[Dict[str, object]] = []
+    problems: List[str] = []
+
+    def skipped(name: str, kind: str, message: str) -> None:
+        problems.append(message)
+        rows.append({"file": name, "kind": kind, "pages": "-", "resumes": 0, "detail": "", "status": "Skipped"})
+
+    for filename, data in files:
+        name = (filename or "").strip() or "unnamed file"
+        lower = name.lower()
+        kind = lower.rsplit(".", 1)[-1].upper() if "." in lower else "?"
+
+        if not lower.endswith(".pdf"):
+            text, error = read_resume_bytes(name, data)
+            if error:
+                skipped(name, kind, error)
+            else:
+                documents.append((name, str(text)))
+                rows.append({"file": name, "kind": kind, "pages": "-", "resumes": 1, "detail": "", "status": "Read"})
+            continue
+
+        precheck = _precheck(name, data)
+        if precheck:
+            skipped(name, kind, precheck)
+            continue
+        try:
+            pages = read_pdf_pages(data)
+        except ImportError as exc:
+            skipped(name, kind, f"'{name}' cannot be read because a required library is missing: {exc}.")
+            continue
+        except ValueError as exc:
+            skipped(name, kind, f"'{name}' could not be read: {exc}.")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            skipped(name, kind, f"'{name}' could not be read ({type(exc).__name__}). The file may be corrupted.")
+            continue
+        if not any(page.strip() for page in pages):
+            skipped(name, kind, f"'{name}' contains no extractable text (scanned images are not supported).")
+            continue
+
+        kept = []
+        for first, last in split_pdf_pages(pages, mode):
+            text = "\n\n".join(pages[first : last + 1]).strip()
+            if text:
+                kept.append((first + 1, last + 1, text))
+        blank_pages = sum(1 for page in pages if not page.strip())
+        if blank_pages and mode == "per_page":
+            problems.append(f"{blank_pages} blank page(s) in '{name}' were skipped.")
+        for first, last, text in kept:
+            label = f"{name} (page {first})" if len(kept) > 1 and first == last else (
+                f"{name} (pages {_range_text(first, last)})" if len(kept) > 1 else name
+            )
+            documents.append((label, text))
+        rows.append(
+            {
+                "file": name, "kind": "PDF", "pages": len(pages), "resumes": len(kept),
+                "detail": ", ".join(_range_text(f, l) for f, l, _ in kept), "status": "Read",
+            }
+        )
+
+    if len(documents) > MAX_RESUMES_PER_RUN:
+        problems.append(f"{len(documents)} resumes were found. Only the first {MAX_RESUMES_PER_RUN} were used.")
+        documents = documents[:MAX_RESUMES_PER_RUN]
+    return documents, rows, problems
+
+
+def ingest_report_html(rows: Sequence[Dict[str, object]]) -> str:
+    """Collapsible summary of how each uploaded file was read."""
+    if not rows:
+        return ""
+    body = "".join(
+        f"<tr><td>{_esc(r['file'])}</td><td>{_esc(r['kind'])}</td><td>{_esc(r['pages'])}</td><td>{_esc(r['resumes'])}</td>"
+        f"<td>{_esc(r['detail'] or '-')}</td><td>{pill_html(str(r['status']), 'ok' if r['status'] == 'Read' else 'bad')}</td></tr>"
+        for r in rows
+    )
+    total = sum(int(r["resumes"]) for r in rows)
+    multi = any(int(r["resumes"]) > 1 for r in rows)
+    return (
+        f'<details class="fh-cand"{" open" if multi else ""}><summary><span class="grow">How your files were read: '
+        f"{total} resume(s) from {len(rows)} file(s)</span></summary><div class=\"fh-cand-body\">"
+        '<div class="fh-table-wrap"><table class="fh-table"><thead><tr><th>File</th><th>Type</th><th>Pages</th>'
+        "<th>Resumes found</th><th>Pages of each resume</th><th>Status</th></tr></thead><tbody>"
+        + body
+        + '</tbody></table></div><div class="fh-muted" style="font-size:.85rem">If a PDF was split in the wrong places, change '
+        "<b>If a PDF contains several resumes</b> and run the screening again. Scanned (image-only) PDFs cannot be read.</div>"
+        "</div></details>"
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -397,10 +610,38 @@ _HEADING_WORDS = frozenset(
     "contact details personal information work professional".split()
 )
 _ROLE_WORDS = frozenset(
-    "developer engineer analyst scientist manager designer intern fresher consultant architect administrator "
-    "specialist student programmer lead director officer".split()
+    "developer engineer engineering analyst analytics scientist science manager management designer design intern fresher "
+    "consultant consulting architect administrator specialist student programmer programming lead director officer executive "
+    "assistant associate senior junior principal staff head chief technician teacher nurse accountant marketing sales finance "
+    "operations development".split()
 )
-_NAME_LINE_RE = re.compile(r"^[A-Z][A-Za-z'\u2019.\-]+(?: [A-Z][A-Za-z'\u2019.\-]+){1,3}$")
+_NAME_PARTICLES = frozenset("de da di du la le van von bin binti al el dos das del".split())
+_NAME_LINE_RE = re.compile(
+    r"^[A-Z][A-Za-z'\u2019.\-]+(?: (?:[A-Z][A-Za-z'\u2019.\-]*|" + "|".join(sorted(_NAME_PARTICLES)) + r")){1,4}$"
+)
+_NAME_VALUE_RE = re.compile(r"(?im)^\s*(?:candidate\s+name|full\s+name|name)\s*[:\-]\s*(.+)$")
+
+
+def _is_name_line(line: str) -> bool:
+    """True for a short line that looks like a person's name (and not a title, heading or skill list)."""
+    line = (line or "").strip()
+    if not line or len(line) > 40 or not _NAME_LINE_RE.match(line):
+        return False
+    words = {w.lower().strip(".") for w in line.split()}
+    return not (words & _HEADING_WORDS or words & _ROLE_WORDS or extract_skills(line))
+
+
+def _name_tokens(name: str) -> List[str]:
+    """The full name and its distinctive parts, for masking later mentions."""
+    tokens = [name.strip()] if " " in name.strip() else []
+    for part in re.findall(r"[A-Za-z][A-Za-z'\u2019\-]+", name):
+        low = part.lower()
+        if (
+            len(part) >= 3 and low not in STOPWORDS and low not in _HEADING_WORDS and low not in _ROLE_WORDS
+            and low not in _NAME_PARTICLES and not extract_skills(part)
+        ):
+            tokens.append(part)
+    return sorted(set(t for t in tokens if t), key=len, reverse=True)
 
 
 def _mask_phone(match: "re.Match[str]") -> str:
@@ -417,8 +658,9 @@ def _mask_phone(match: "re.Match[str]") -> str:
 def anonymize_text(text: str) -> str:
     """Mask names, contact details, personal attributes and gendered words.
 
-    This is best-effort pattern matching. It will miss some identifying details
-    (for example a name in the middle of a sentence), so review before sharing.
+    This is best-effort pattern matching. It finds the name from a "Name:" line or the first
+    few lines, then masks later mentions of it. It will miss some identifying details (for
+    example a different spelling, a nickname, or a name that only appears mid-sentence).
     """
     if not text:
         return ""
@@ -426,25 +668,36 @@ def anonymize_text(text: str) -> str:
     out = _EMAIL_RE.sub("[EMAIL]", out)
     out = _URL_RE.sub("[URL]", out)
     out = _PHONE_RE.sub(_mask_phone, out)
+
+    names: List[str] = []
+    labelled = _NAME_VALUE_RE.search(out)
+    if labelled:
+        names.append(labelled.group(1).strip())
     out = _NAME_LABEL_RE.sub(r"\1[NAME]", out)
     out = _DOB_RE.sub("[DOB]", out)
     out = _PERSONAL_LABEL_RE.sub("[REDACTED PERSONAL DETAIL]", out)
     out = _STREET_RE.sub("[ADDRESS]", out)
 
     lines = out.splitlines()
+    seen = 0
     for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             continue
-        words = {w.lower() for w in stripped.split()}
-        looks_like_title = bool(words & _HEADING_WORDS) or bool(words & _ROLE_WORDS) or bool(extract_skills(stripped))
-        if _NAME_LINE_RE.match(stripped) and not looks_like_title:
+        seen += 1
+        if _is_name_line(stripped):
+            names.append(stripped)
             lines[index] = "[NAME]"
-        break  # only the first non-empty line is treated as a possible name
+            break
+        if seen >= 3:
+            break
     out = "\n".join(lines)
 
-    out = _GENDERED_RE.sub("[G]", out)
-    return out
+    for name in names:
+        for token in _name_tokens(name):
+            out = re.sub(r"(?<![A-Za-z0-9])" + re.escape(token) + r"(?![A-Za-z0-9])", "[NAME]", out, flags=re.IGNORECASE)
+
+    return _GENDERED_RE.sub("[G]", out)
 
 
 # --------------------------------------------------------------------------------------
@@ -796,17 +1049,15 @@ def swap_gender_terms(text: str) -> str:
 
 
 def detect_name(text: str) -> Optional[str]:
-    """Best-effort guess of the candidate's name (labelled line, else a name-like first line)."""
+    """Best-effort guess of the candidate's name (a "Name:" line, else a name-like line near the top)."""
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     for line in lines[:6]:
         match = _NAME_LABEL_VALUE_RE.match(line)
         if match and match.group(1).strip():
             return match.group(1).strip()[:60]
-    if lines:
-        first = lines[0]
-        words = {w.lower() for w in first.split()}
-        if _NAME_LINE_RE.match(first) and not (words & _HEADING_WORDS):
-            return first
+    for line in lines[:3]:
+        if _is_name_line(line):
+            return line
     return None
 
 
@@ -1352,6 +1603,14 @@ The demo experiment uses **synthetic** candidates whose qualifications are drawn
 both groups. The "biased process" is a simulated reviewer penalty added only to show what the audit can detect.
 **These results are simulations, not evidence about real hiring.**
 
+### Reading real resumes
+Upload TXT, PDF or DOCX files. A single PDF can hold many resumes: FairHire looks at the contact details and layout at the top
+of each page to find where each resume starts, keeps continuation pages together, and scores each resume separately. You can
+override this with "One resume per page" or "Treat each PDF as one resume". The table "How your files were read" shows what
+was found. Limits: scanned (image-only) PDFs cannot be read because there is no text layer; two-column layouts and unusual
+templates can scramble the text order; automatic splitting is a heuristic and can be wrong for resumes without contact details.
+Always check the file summary before trusting a ranking.
+
 ### Adjustable weights
 The three weights can be changed with sliders and are rescaled to add up to 100%, so rankings update live. Any component
 you have not configured is skipped. Changing weights changes who ranks first, so record the weights you used (the report does).
@@ -1774,7 +2033,9 @@ def results_table_html(results: Sequence[Dict[str, object]], top_n: int, show_fi
     )
 
 
-def candidate_card_html(item: Dict[str, object], show_files: bool = False, open_card: bool = False) -> str:
+def candidate_card_html(
+    item: Dict[str, object], show_files: bool = False, open_card: bool = False, show_original: bool = False
+) -> str:
     score = clamp(float(item["score"]))
     label = _esc(item["candidate_id"])
     if show_files:
@@ -1793,7 +2054,11 @@ def candidate_card_html(item: Dict[str, object], show_files: bool = False, open_
     used = str(item.get("text_used", ""))
     original = str(item.get("original_text", used))
     redactions = int(item.get("redactions", 0) or 0)
-    if redactions or used != original:
+    if not show_original:
+        # blind review: only the text the scorer actually saw (anonymized when anonymization is on)
+        diff_summary = f"Text used for scoring ({redactions} items masked)" if redactions else "Text used for scoring"
+        diff_body = f"<pre>{_esc(used[:3000])}</pre>"
+    elif redactions or used != original:
         diff_summary = f"Before / after anonymization ({redactions} items masked)"
         diff_body = redaction_diff_html(original, used)
     else:
@@ -2036,7 +2301,7 @@ def build_audit_report_html(sections: Sequence[Dict[str, object]], generated_on:
 # browser session (st.session_state) and disappear when the tab closes or you sign out.
 # --------------------------------------------------------------------------------------
 
-PROTOTYPE_BANNER = "Prototype mode: sign-in is simulated and saved items live only in this browser tab."
+PROTOTYPE_BANNER = "Sign-in and the dashboard are a simulated prototype. Resume screening is real: files you upload are read in memory and never saved."
 PROTOTYPE_FOOTNOTE = "Illustrative prototype. No real accounts are created and nothing you enter is stored or sent."
 MAX_SAVED_ITEMS = 25
 MAX_SAVED_REPORT_BYTES = 1_000_000
@@ -2470,6 +2735,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         "min_years": 0.0, "shortlist": 3, "w_skill": 60, "w_exp": 25, "w_kw": 15,
         "custom_skills_text": "", "extra_skills_text": "", "anonymize": True, "reveal_files": False,
         "stress_raw": False, "auth_view": "login", "job_title": "", "report_title": "", "audit_title": "",
+        "split_mode": "Detect automatically", "ingest_rows": [], "show_original": False,
     }
     for key, value in defaults.items():
         state.setdefault(key, value)
@@ -2576,27 +2842,25 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                     st.rerun()
             st.checkbox("Anonymize resumes before scoring", key="anonymize")
             st.checkbox("Show file names in results", key="reveal_files")
+            st.checkbox("Show the original text next to the anonymized text (reveals names)", key="show_original")
 
             st.markdown(section_html("Upload resumes", 2), unsafe_allow_html=True)
             files = st.file_uploader(
-                "TXT, PDF or DOCX (max 5 MB each)", type=["txt", "pdf", "docx"], accept_multiple_files=True
+                "TXT, PDF or DOCX (max 25 MB each)", type=["txt", "pdf", "docx"], accept_multiple_files=True
             )
+            st.selectbox("If a PDF contains several resumes", list(SPLIT_MODES), key="split_mode")
+            st.caption("Resumes are read in memory for this session only and are never saved.")
             run = st.button("Run screening", type="primary", use_container_width=True)
 
         demo_requested = state.pop("run_demo", False)
         if run or demo_requested:
-            documents: List[Tuple[str, str]] = []
-            problems: List[str] = []
-            for uploaded in files or []:
-                text, error = read_resume_bytes(uploaded.name, uploaded.getvalue())
-                if error:
-                    problems.append(error)
-                else:
-                    documents.append((uploaded.name, text))
+            uploads = [(u.name, u.getvalue()) for u in files or []]
+            documents, ingest_rows, problems = ingest_uploads(uploads, SPLIT_MODES.get(state["split_mode"], "auto"))
             if state["use_sample"]:
                 documents.extend(SAMPLE_RESUMES.items())
             state["docs"] = documents
             state["read_problems"] = problems
+            state["ingest_rows"] = ingest_rows
             state["notice"] = "" if documents else "Upload at least one readable resume, or tick the sample option."
 
         extras = [s.strip() for s in state["extra_skills_text"].split(",") if s.strip()]
@@ -2626,6 +2890,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 st.markdown(note_html(state["notice"], "info", "ℹ️"), unsafe_allow_html=True)
             for message in list(state["read_problems"]) + warns + custom_warns:
                 st.markdown(note_html(message, "warn", "⚠️"), unsafe_allow_html=True)
+            if state["ingest_rows"]:
+                st.markdown(ingest_report_html(state["ingest_rows"]), unsafe_allow_html=True)
 
             if not results:
                 st.markdown(
@@ -2673,11 +2939,17 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 st.markdown(section_html("Why each candidate scored as they did"), unsafe_allow_html=True)
                 st.markdown(
                     "".join(
-                        candidate_card_html(item, reveal_files, open_card=(index == 0))
-                        for index, item in enumerate(results)
+                        candidate_card_html(item, reveal_files, open_card=(index == 0), show_original=bool(state["show_original"]))
+                        for index, item in enumerate(results[:MAX_DETAIL_CARDS])
                     ),
                     unsafe_allow_html=True,
                 )
+                if len(results) > MAX_DETAIL_CARDS:
+                    rest = results[MAX_DETAIL_CARDS:]
+                    _show(st, f"Showing details for the top {MAX_DETAIL_CARDS} of {len(results)} candidates. Pick any other candidate below.", "info", "ℹ️")
+                    rest_labels = [f"{r['candidate_id']} ({float(r['score']):.1f})" for r in rest]
+                    pick = st.selectbox("Open details for another candidate", rest_labels)
+                    st.markdown(candidate_card_html(rest[rest_labels.index(pick)], reveal_files, open_card=True, show_original=bool(state["show_original"])), unsafe_allow_html=True)
 
     # ------------------------------------------------------------------ Fairness audit tab
     # (built before the review tab so the report can include the latest simulation)
@@ -2771,8 +3043,11 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 ),
                 unsafe_allow_html=True,
             )
+            review_items = results[:MAX_REVIEW_ITEMS]
+            if len(results) > MAX_REVIEW_ITEMS:
+                st.caption(f"Recording decisions for the top {MAX_REVIEW_ITEMS} of {len(results)} candidates.")
             with st.form("review_form"):
-                for item in results:
+                for item in review_items:
                     fingerprint = str(item["fingerprint"])[:12]
                     saved = state["review_log"].get(fingerprint, {})
                     c1, c2, c3 = st.columns([2, 2, 4])
@@ -2790,7 +3065,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             if submitted:
                 errors: List[str] = []
                 new_log = dict(state["review_log"])
-                for item in results:
+                for item in review_items:
                     fingerprint = str(item["fingerprint"])[:12]
                     decision = state.get(f"dec_{fingerprint}", "Not reviewed")
                     reason = str(state.get(f"why_{fingerprint}", "")).strip()
@@ -2873,12 +3148,15 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         else:
             st.checkbox("Test the raw text (ignore the anonymization setting)", key="stress_raw")
             use_anonymize = bool(state["anonymize"]) and not state["stress_raw"]
+            stress_items = results[:MAX_STRESS_ITEMS]
+            if len(results) > MAX_STRESS_ITEMS:
+                st.caption(f"Testing the top {MAX_STRESS_ITEMS} of {len(results)} candidates.")
             tests = [
                 bias_stress_test(
                     str(item["original_text"]), required, state["jd_text"], float(state["min_years"]),
                     weights, bank, use_anonymize,
                 )
-                for item in results
+                for item in stress_items
             ]
             unchanged = sum(1 for t in tests if t["passed"])
             worst = max(float(t["max_abs_delta"]) for t in tests)
@@ -2892,8 +3170,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 ),
                 unsafe_allow_html=True,
             )
-            st.markdown(stress_summary_html(results, tests), unsafe_allow_html=True)
-            labels = [f"{item['candidate_id']} ({float(item['score']):.1f})" for item in results]
+            st.markdown(stress_summary_html(stress_items, tests), unsafe_allow_html=True)
+            labels = [f"{item['candidate_id']} ({float(item['score']):.1f})" for item in stress_items]
             chosen = st.selectbox("See the variants for one candidate", labels, index=0)
             st.markdown(stress_detail_html(tests[labels.index(chosen)]), unsafe_allow_html=True)
 
