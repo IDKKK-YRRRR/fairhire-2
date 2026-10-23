@@ -28,6 +28,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
+import auth
+
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
@@ -867,6 +869,8 @@ def screen_resumes(
         detail["fingerprint"] = fingerprint
         detail["redactions"] = count_redactions(working_text) if anonymize else 0
         detail["proxy_flags"] = detect_proxy_risks(working_text, current_year)
+        detail["evidence"] = find_skill_evidence(working_text, detail["matched_skills"], skill_bank)
+        detail["experience_evidence"] = experience_evidence(working_text, current_year)
         results.append(detail)
 
     # Deterministic order: score desc, then more matched skills, then file name.
@@ -1304,7 +1308,7 @@ def build_report_html(
         ("Scoring weights", f"skills {w_skill:g}% / experience {w_exp:g}% / keywords {w_kw:g}%"),
         ("Anonymization before scoring", "On" if settings.get("anonymize") else "Off"),
         ("Shortlist size", str(settings.get("shortlist", ""))),
-    ]
+    ] + ([("Job-description wording flags", str(settings["jd_flags"]))] if "jd_flags" in settings else [])
     settings_html = "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in settings_rows)
 
     top_n = int(settings.get("shortlist", 0) or 0)
@@ -1603,6 +1607,24 @@ The demo experiment uses **synthetic** candidates whose qualifications are drawn
 both groups. The "biased process" is a simulated reviewer penalty added only to show what the audit can detect.
 **These results are simulations, not evidence about real hiring.**
 
+### Job description check
+A rule-based scan of a job post for wording that can discourage or exclude groups of applicants: gender-coded words, age
+references, nationality or language requirements, family status, appearance, health requirements and prestige-school wording.
+It also counts masculine- and feminine-coded words from published word lists as a rough indicator. It is not exhaustive and a
+flag is a prompt to reconsider the wording, not proof of discrimination. Automatic replacements are limited to safe word swaps;
+review the result before using it.
+
+### Skill evidence
+For every matched skill the candidate card shows short snippets from the resume (the text the scorer saw, so anonymized when
+anonymization is on) with the match highlighted, plus the sentences behind the experience figure. Skills the scorer could not
+find are listed as not found. Evidence is shown on screen only and is not copied into saved reports.
+
+### Accounts and storage
+You can sign in with a **real account** or a **prototype** (simulated) sign-in. Real accounts store an email and a salted password
+hash, plus your saved jobs, reports and audits, in the app's database. With a Postgres `database_url` configured, data survives
+restarts. Without one, a local file is used and can be wiped when the app restarts. Administrators can manage accounts but cannot
+read anyone's saved data. Resumes are never saved in either mode. The prototype stores nothing outside the browser tab.
+
 ### Reading real resumes
 Upload TXT, PDF or DOCX files. A single PDF can hold many resumes: FairHire looks at the contact details and layout at the top
 of each page to find where each resume starts, keeps continuation pages together, and scores each resume separately. You can
@@ -1633,12 +1655,6 @@ that there is no bias. With three or more groups no multiple-comparison correcti
 ### Reviewer decisions and report
 You record Advance, Hold or Reject for each candidate, with a job-related reason required for Hold and Reject. The
 downloadable report bundles the settings, ranking, explanations, flags, fairness results and your decisions.
-
-### Accounts (prototype)
-The sign-up, sign-in, email-code, password-reset, dashboard and administrator screens are a **prototype**. No account is
-created, no password is kept, no email is sent and nothing is written to a database. Saved jobs, reports and audits live only
-in this browser tab and disappear when you close it or sign out. Items marked (sample) are made up. A real version would need
-password hashing, a database, email delivery and access controls. Resumes are never saved.
 
 ### Limitations and responsible use
 * Masking identity does not make a process unbiased. Skills lists, schools, employers, gaps and writing style can
@@ -1825,6 +1841,10 @@ mark.fh-add {background: var(--ok_soft); color: var(--ok); border-radius: 4px; p
 .fh-auth-title {font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; margin: 1.1rem 0 .4rem; color: var(--text);}
 .fh-auth-sub {color: var(--muted); line-height: 1.55; margin-bottom: 1rem;}
 .fh-meter {margin: .2rem 0 .6rem;}
+mark.fh-hit {background: var(--ok_soft); color: var(--ok); border-radius: 4px; padding: 0 2px; font-weight: 600;}
+.fh-ev {display: flex; gap: .6rem; align-items: baseline; margin: .35rem 0; font-size: .88rem; color: var(--text);}
+.fh-ev .fh-chip {flex: none;} .fh-ev-text {line-height: 1.5;}
+[data-testid="stRadio"] label, [data-testid="stRadio"] label p {color: var(--text) !important;}
 @media (max-width: 720px) {.block-container {padding: 4.2rem .7rem 2rem;} .fh-title {font-size: 1.4rem;} .fh-hero {padding: 1rem;} .fh-kpi-value {font-size: 1.35rem;}}
 """
 
@@ -2034,7 +2054,11 @@ def results_table_html(results: Sequence[Dict[str, object]], top_n: int, show_fi
 
 
 def candidate_card_html(
-    item: Dict[str, object], show_files: bool = False, open_card: bool = False, show_original: bool = False
+    item: Dict[str, object],
+    show_files: bool = False,
+    open_card: bool = False,
+    show_original: bool = False,
+    skill_bank: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     score = clamp(float(item["score"]))
     label = _esc(item["candidate_id"])
@@ -2057,7 +2081,7 @@ def candidate_card_html(
     if not show_original:
         # blind review: only the text the scorer actually saw (anonymized when anonymization is on)
         diff_summary = f"Text used for scoring ({redactions} items masked)" if redactions else "Text used for scoring"
-        diff_body = f"<pre>{_esc(used[:3000])}</pre>"
+        diff_body = f"<pre>{highlight_skills_html(used, item.get('matched_skills', []), skill_bank)}</pre>"
     elif redactions or used != original:
         diff_summary = f"Before / after anonymization ({redactions} items masked)"
         diff_body = redaction_diff_html(original, used)
@@ -2070,6 +2094,7 @@ def candidate_card_html(
         f'{pill_html(f"{score:.1f} / 100", score_tone(score))}</summary><div class="fh-cand-body">'
         f'<h5>Score breakdown</h5><div class="fh-stack">{stack}</div><div class="fh-legend">{legend}</div>'
         f'<h5>Matched skills</h5>{chips_html(item["matched_skills"], "ok")}'
+        f'<h5>Evidence from the resume</h5>{evidence_html(item)}'
         f'<h5>Missing skills</h5>{chips_html(item["missing_skills"], "bad")}'
         f'<h5>Other skills detected</h5>{chips_html(item["extra_skills"], "neutral")}'
         f'<h5>Detected experience</h5><div>{float(item["years_experience"]):g} years</div>'
@@ -2294,6 +2319,422 @@ def build_audit_report_html(sections: Sequence[Dict[str, object]], generated_on:
 
 
 # --------------------------------------------------------------------------------------
+# Job description bias checker
+# --------------------------------------------------------------------------------------
+
+# (category, severity, regex, why it matters, suggestion, automatic replacement or None)
+_BIAS_RULES_RAW = [
+    ("Gender-coded", "medium", r"\brock\s?stars?\b", "Macho job titles can put some applicants off.", "Describe the skills you need instead.", "skilled professional"),
+    ("Gender-coded", "medium", r"\bninjas?\b", "Macho job titles can put some applicants off.", "Describe the skills you need instead.", "expert"),
+    ("Gender-coded", "medium", r"\bgurus?\b", "Macho job titles can put some applicants off.", "Describe the skills you need instead.", "specialist"),
+    ("Gender-coded", "medium", r"\bguys\b", "'Guys' reads as male.", "Use 'team' or 'everyone'.", "team"),
+    ("Gender-coded", "medium", r"\bmanpower\b", "Gendered noun.", "Use 'workforce' or 'staff'.", "workforce"),
+    ("Gender-coded", "medium", r"\bsales(?:man|men)\b", "Gendered job title.", "Use 'salesperson'.", "salesperson"),
+    ("Gender-coded", "medium", r"\bchairman\b", "Gendered job title.", "Use 'chair'.", "chair"),
+    ("Gender-coded", "medium", r"\bforeman\b", "Gendered job title.", "Use 'supervisor'.", "supervisor"),
+    ("Gender-coded", "medium", r"\bbusinessman\b", "Gendered job title.", "Use 'businessperson'.", "businessperson"),
+    ("Gender-coded", "low", r"\b(?:he|his|him|himself)\b", "A male pronoun for the candidate.", "Address the reader as 'you' or use 'they'.", None),
+    ("Gender-coded", "low", r"\b(?:she|her|hers|herself)\b", "A female pronoun for the candidate.", "Address the reader as 'you' or use 'they'.", None),
+    ("Gender-coded", "medium", r"\baggressive\b", "Masculine-coded wording can discourage some applicants.", "Try 'proactive' or 'ambitious'.", "proactive"),
+    ("Gender-coded", "medium", r"\bdominant\b", "Masculine-coded wording can discourage some applicants.", "Try 'leading'.", "leading"),
+    ("Gender-coded", "medium", r"\bfearless\b", "Masculine-coded wording can discourage some applicants.", "Try 'confident'.", "confident"),
+    ("Culture", "medium", r"\bwork[- ]hard,?\s*play[- ]hard\b", "Can signal long hours and a social culture that excludes people with caring duties.", "Describe the working style and support you offer.", "collaborative and supportive team"),
+    ("Culture", "medium", r"\bcultur(?:e|al)[- ]fit\b", "'Fit' is subjective and can favour people similar to the existing team.", "Name the values you are looking for.", "values alignment"),
+    ("Age", "high", r"\b(?:young(?:er)?|youthful)\b", "Age-related wording can exclude older applicants and is unlawful in many places.", "Remove it and describe the skills needed.", None),
+    ("Age", "medium", r"\benergetic\b", "Often read as a code word for youth.", "Try 'motivated'.", "motivated"),
+    ("Age", "medium", r"\bdigital natives?\b", "Implies a particular generation.", "Try 'comfortable with digital tools'.", "comfortable with digital tools"),
+    ("Age", "medium", r"\b(?:recent|fresh)\s+graduates?\b", "Excludes experienced applicants.", "State the experience level you need (for example 'early-career').", "early-career applicants"),
+    ("Age", "high", r"\b(?:no more than|maximum of|max\.?|up to)\s+\d+\s+years?\s+(?:of\s+)?experience\b", "An experience ceiling can exclude older applicants.", "State a minimum, not a maximum.", None),
+    ("Age", "high", r"\bage[ds]?\s+(?:between\s+)?\d{2}\b|\bunder\s+\d{2}\s+years?\s+old\b|\bbetween the ages of\b", "States an age requirement.", "Remove it.", None),
+    ("Age", "low", r"\boverqualified\b", "Can screen out experienced applicants.", "State what you need rather than screening out experience.", None),
+    ("Disability / health", "high", r"\bable[- ]bodied\b", "Excludes people with disabilities.", "State the essential tasks and offer reasonable adjustments.", None),
+    ("Disability / health", "medium", r"\b(?:physically fit|perfect health|good health)\b", "Health requirements can exclude people with disabilities.", "State the essential physical tasks and offer reasonable adjustments.", None),
+    ("Nationality / language", "medium", r"\bnative english speakers?\b", "Excludes fluent non-native speakers.", "Say 'fluent in English' and the level you need.", "fluent English speaker"),
+    ("Nationality / language", "medium", r"\bnative speakers?\b|\bnative[- ]level\b", "Excludes fluent non-native speakers.", "State the language level you need.", None),
+    ("Nationality / language", "high", r"\b(?:citizens only|nationals only|local candidates only|must be a (?:citizen|national)|only (?:citizens|nationals))\b", "Can discriminate by national origin.", "Ask about the legal right to work instead.", None),
+    ("Family / marital status", "high", r"\b(?:unmarried|married|childless|no children|no (?:family )?commitments|single (?:man|woman|person|male|female))\b", "Family status is a protected characteristic in many places.", "Remove it.", None),
+    ("Appearance", "high", r"\b(?:attractive|good[- ]looking|well[- ]groomed|good appearance|pleasant appearance|presentable|send (?:a )?photo)\b", "Appearance is not a job requirement.", "Remove it.", None),
+    ("Background", "medium", r"\b(?:top[- ]tier|elite|prestigious)\s+(?:universit(?:y|ies)|schools?|colleges?)\b|\bivy league\b", "Favours people from privileged backgrounds.", "Ask for a relevant degree or equivalent experience.", None),
+]
+_BIAS_RULES = [(c, s, re.compile(p, re.IGNORECASE), w, g, r) for c, s, p, w, g, r in _BIAS_RULES_RAW]
+
+_MASCULINE_STEMS = [
+    "aggress", "ambitio", "assert", "boast", "competitive", "confiden", "courag", "decisive", "determin", "dominan", "driven",
+    "fearless", "fight", "headstrong", "hierarch", "hostil", "impulsiv", "independen", "outspoken", "persist", "reckless",
+    "self-reliant", "self-sufficien", "stubborn", "superior", "ninja", "rockstar", "rock star", "guru",
+]
+_FEMININE_STEMS = [
+    "affection", "agree", "caring", "cheer", "collaborat", "communal", "compassion", "connect", "considerate", "cooperat",
+    "dependab", "emotion", "empath", "gentle", "honest", "interpersonal", "interdependen", "loyal", "modest", "nurtur",
+    "pleasant", "polite", "quiet", "sensitiv", "support", "sympath", "tender", "together", "trust", "understand", "warm", "yield",
+]
+_MASC_RE = re.compile(r"\b(?:" + "|".join(re.escape(s) for s in _MASCULINE_STEMS) + r")\w*", re.IGNORECASE)
+_FEM_RE = re.compile(r"\b(?:" + "|".join(re.escape(s) for s in _FEMININE_STEMS) + r")\w*", re.IGNORECASE)
+
+
+def gender_coding(text: str) -> Dict[str, object]:
+    """Count masculine- and feminine-coded words (a rough indicator based on published word lists)."""
+    masculine = [m.group(0).lower() for m in _MASC_RE.finditer(text or "")]
+    feminine = [m.group(0).lower() for m in _FEM_RE.finditer(text or "")]
+    if not masculine and not feminine:
+        label = "Neutral"
+    elif len(masculine) >= len(feminine) + 3:
+        label = "Leans masculine-coded"
+    elif len(feminine) >= len(masculine) + 3:
+        label = "Leans feminine-coded"
+    else:
+        label = "Balanced"
+    return {
+        "masculine": len(masculine), "feminine": len(feminine), "label": label,
+        "masculine_words": sorted(set(masculine)), "feminine_words": sorted(set(feminine)),
+    }
+
+
+def check_job_description(text: str) -> Dict[str, object]:
+    """Flag wording in a job description that can discourage or exclude groups of applicants.
+
+    Rule-based and not exhaustive. A finding is a prompt to reconsider the wording, not proof of
+    discrimination, and an empty result does not mean the posting is free of bias.
+    """
+    text = text or ""
+    findings: List[Dict[str, object]] = []
+    seen = set()
+    for category, severity, pattern, why, suggestion, replacement in _BIAS_RULES:
+        for match in pattern.finditer(text):
+            span = (match.start(), match.end())
+            if span in seen:
+                continue
+            seen.add(span)
+            left = max(0, match.start() - 45)
+            right = min(len(text), match.end() + 45)
+            findings.append(
+                {
+                    "term": match.group(0), "category": category, "severity": severity, "why": why,
+                    "suggestion": suggestion, "replacement": replacement, "start": match.start(), "end": match.end(),
+                    "snippet": re.sub(r"\s+", " ", text[left:right]).strip(),
+                }
+            )
+    findings.sort(key=lambda f: (int(f["start"]), int(f["end"])))
+    bullets = len(re.findall(r"(?m)^\s*[-\u2022*\u00b7\u25aa\u25cf]\s+", text))
+    if bullets > 12:
+        findings.append(
+            {
+                "term": f"{bullets} bullet points", "category": "Requirements overload", "severity": "low",
+                "why": "Very long requirement lists can discourage qualified applicants who do not tick every box.",
+                "suggestion": "Mark which requirements are essential and keep the list focused.", "replacement": None,
+                "start": len(text), "end": len(text), "snippet": "",
+            }
+        )
+    counts = {level: sum(1 for f in findings if f["severity"] == level) for level in ("high", "medium", "low")}
+    score = 3 * counts["high"] + 2 * counts["medium"] + counts["low"]
+    if not findings:
+        risk = "none"
+    elif counts["high"]:
+        risk = "high"
+    elif score >= 4:
+        risk = "medium"
+    else:
+        risk = "low"
+    return {
+        "findings": findings, "counts": counts, "risk": risk, "gender": gender_coding(text),
+        "word_count": len(re.findall(r"\b\w+\b", text)),
+    }
+
+
+def rewrite_job_description(text: str, findings: Sequence[Dict[str, object]]) -> Tuple[str, int]:
+    """Apply the safe automatic replacements. Returns ``(revised_text, number_of_changes)``."""
+    out = text or ""
+    changes = 0
+    for finding in sorted((f for f in findings if f.get("replacement")), key=lambda f: int(f["start"]), reverse=True):
+        start, end = int(finding["start"]), int(finding["end"])
+        original = out[start:end]
+        if original.lower() != str(finding["term"]).lower():
+            continue  # the text changed since the check
+        replacement = str(finding["replacement"])
+        if original.isupper() and len(original) > 1:
+            replacement = replacement.upper()
+        elif original[:1].isupper():
+            replacement = replacement[:1].upper() + replacement[1:]
+        out = out[:start] + replacement + out[end:]
+        changes += 1
+    return out, changes
+
+
+_RISK_TONE = {"none": "ok", "low": "ok", "medium": "warn", "high": "bad"}
+_SEVERITY_CHIP = {"high": "bad", "medium": "warn", "low": "neutral"}
+
+
+def jd_summary_html(result: Dict[str, object]) -> str:
+    gender = result["gender"]
+    counts = result["counts"]
+    risk = str(result["risk"])
+    return kpis_html(
+        [
+            kpi_card("Wording flags", len(result["findings"]), f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low"),
+            kpi_card("Overall wording risk", risk.capitalize(), "", _RISK_TONE.get(risk, "neutral")),
+            kpi_card("Gender coding", str(gender["label"]), f"{gender['masculine']} masculine-coded, {gender['feminine']} feminine-coded words"),
+            kpi_card("Words analysed", result["word_count"]),
+        ]
+    )
+
+
+def gender_bar_html(gender: Dict[str, object]) -> str:
+    total = max(1, int(gender["masculine"]) + int(gender["feminine"]))
+    rows = []
+    for label, count, words, color in (
+        ("Masculine-coded", int(gender["masculine"]), gender["masculine_words"], _BAR_GRADIENTS[1]),
+        ("Feminine-coded", int(gender["feminine"]), gender["feminine_words"], _BAR_GRADIENTS[2]),
+    ):
+        width = 100.0 * count / total
+        rows.append(
+            f'<div class="fh-rate"><div class="fh-rate-head"><span>{label}</span><span>{count}</span></div>'
+            f'<div class="fh-bar"><i style="width:{width:.1f}%;background:{color}"></i></div>'
+            f'<div style="margin-top:.3rem">{chips_html(list(words)[:12], "neutral")}</div></div>'
+        )
+    return '<div class="fh-panel">' + "".join(rows) + (
+        '<div class="fh-muted" style="font-size:.8rem;margin-top:.5rem">A rough indicator based on published word lists. '
+        "It is not proof that anyone is excluded, and some of these words are fine in context.</div></div>"
+    )
+
+
+def jd_findings_html(result: Dict[str, object]) -> str:
+    findings = result["findings"]
+    if not findings:
+        return empty_state_html("No flagged wording found", "That does not guarantee the posting is unbiased. Ask a colleague to read it too.", "✅")
+    rows = []
+    for f in findings:
+        snippet = f'<div class="fh-muted" style="font-size:.78rem">{_esc(f["snippet"])}</div>' if f["snippet"] else ""
+        rows.append(
+            f'<tr><td><span class="fh-chip {_SEVERITY_CHIP[str(f["severity"])]}">{_esc(f["term"])}</span>{snippet}</td>'
+            f'<td>{_esc(f["category"])}</td><td>{_esc(f["why"])}</td><td>{_esc(f["suggestion"])}</td></tr>'
+        )
+    return (
+        '<div class="fh-table-wrap"><table class="fh-table"><thead><tr><th>Wording</th><th>Category</th><th>Why it matters</th>'
+        "<th>Suggestion</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Skill evidence: show where in the resume each matched skill was found
+# --------------------------------------------------------------------------------------
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
+    left = max(text.rfind("\n", 0, start), text.rfind(". ", 0, start), text.rfind("! ", 0, start), text.rfind("? ", 0, start))
+    left = 0 if left < 0 else left + 1
+    stops = [i for i in (text.find("\n", end), text.find(". ", end), text.find("! ", end), text.find("? ", end)) if i != -1]
+    right = min(stops) + 1 if stops else len(text)
+    return left, right
+
+
+def _snippet(text: str, start: int, end: int, window: int = 110) -> Dict[str, object]:
+    left_bound, right_bound = _sentence_bounds(text, start, end)
+    left = max(left_bound, start - window)
+    right = min(right_bound, end + window)
+    return {
+        "before": text[left:start].lstrip(), "hit": text[start:end], "after": text[end:right].rstrip(),
+        "left_cut": left > left_bound, "right_cut": right < right_bound,
+    }
+
+
+def find_skill_evidence(
+    text: str,
+    skills: Sequence[str],
+    skill_bank: Optional[Dict[str, List[str]]] = None,
+    per_skill: int = 2,
+) -> Dict[str, List[Dict[str, object]]]:
+    """For each skill, up to ``per_skill`` short snippets from different sentences where it appears."""
+    evidence: Dict[str, List[Dict[str, object]]] = {}
+    text = text or ""
+    for skill in skills:
+        matches = []
+        for alias in _skill_aliases(skill, skill_bank):
+            matches.extend(_alias_pattern(alias).finditer(text))
+        matches.sort(key=lambda m: m.start())
+        snippets: List[Dict[str, object]] = []
+        used_sentences = set()
+        for match in matches:
+            bounds = _sentence_bounds(text, match.start(), match.end())
+            if bounds in used_sentences:
+                continue
+            used_sentences.add(bounds)
+            snippets.append(_snippet(text, match.start(), match.end()))
+            if len(snippets) >= per_skill:
+                break
+        if snippets:
+            evidence[skill] = snippets
+    return evidence
+
+
+def experience_evidence(text: str, current_year: Optional[int] = None, limit: int = 3) -> List[Dict[str, object]]:
+    """Snippets that explain the detected experience (stated years and employment date ranges)."""
+    text = text or ""
+    found: List[Tuple[int, Dict[str, object]]] = []
+    for pattern in _STATED_YEARS_PATTERNS:
+        for match in pattern.finditer(text):
+            found.append((match.start(), _snippet(text, match.start(), match.end())))
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\n")
+        if not _EDUCATION_WORDS.search(stripped):
+            for match in _DATE_RANGE.finditer(stripped):
+                found.append((offset + match.start(), _snippet(text, offset + match.start(), offset + match.end())))
+        offset += len(line)
+    found.sort(key=lambda pair: pair[0])
+    out: List[Dict[str, object]] = []
+    seen = set()
+    for _, snippet in found:
+        key = (snippet["before"], snippet["hit"], snippet["after"])
+        if key not in seen:
+            seen.add(key)
+            out.append(snippet)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def snippet_html(snippet: Dict[str, object]) -> str:
+    return (
+        ("…" if snippet.get("left_cut") else "") + _esc(snippet.get("before", ""))
+        + f'<mark class="fh-hit">{_esc(snippet.get("hit", ""))}</mark>'
+        + _esc(snippet.get("after", "")) + ("…" if snippet.get("right_cut") else "")
+    )
+
+
+def evidence_html(item: Dict[str, object]) -> str:
+    rows = []
+    for skill, snippets in (item.get("evidence") or {}).items():
+        for snippet in snippets:
+            rows.append(f'<div class="fh-ev"><span class="fh-chip ok">{_esc(skill)}</span><span class="fh-ev-text">{snippet_html(snippet)}</span></div>')
+    for snippet in item.get("experience_evidence") or []:
+        rows.append(f'<div class="fh-ev"><span class="fh-chip neutral">experience</span><span class="fh-ev-text">{snippet_html(snippet)}</span></div>')
+    missing = item.get("missing_skills") or []
+    if missing:
+        rows.append(f'<div class="fh-muted" style="font-size:.85rem;margin-top:.3rem">Not found anywhere in the resume text: {_esc(", ".join(missing))}</div>')
+    return "".join(rows) or '<span class="fh-muted">No evidence to show.</span>'
+
+
+def highlight_skills_html(text: str, skills: Sequence[str], skill_bank: Optional[Dict[str, List[str]]] = None, limit: int = 3000) -> str:
+    """The resume text (escaped) with every mention of the given skills highlighted."""
+    text = (text or "")[:limit]
+    spans: List[Tuple[int, int]] = []
+    for skill in skills:
+        for alias in _skill_aliases(skill, skill_bank):
+            spans.extend((m.start(), m.end()) for m in _alias_pattern(alias).finditer(text))
+    spans.sort()
+    merged: List[List[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    out, cursor = [], 0
+    for start, end in merged:
+        out.append(_esc(text[cursor:start]))
+        out.append(f'<mark class="fh-hit">{_esc(text[start:end])}</mark>')
+        cursor = end
+    out.append(_esc(text[cursor:]))
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------------------
+# Where "saved" items live: this browser tab (prototype) or the database (real accounts)
+# --------------------------------------------------------------------------------------
+
+
+class SessionWorkspace:
+    """Saved jobs and reports for the prototype: kept only in the browser session."""
+
+    persistent = False
+    label = "this browser tab only"
+
+    def __init__(self, state):
+        self.state = state
+
+    def list_jobs(self) -> List[Dict[str, object]]:
+        return [dict(j) for j in reversed(self.state.get("saved_jobs", []))]
+
+    def get_job(self, job_id: int) -> Optional[Dict[str, object]]:
+        return next((dict(j) for j in self.state.get("saved_jobs", []) if j["id"] == job_id), None)
+
+    def add_job(self, title: str, jd_text: str, settings: Dict[str, object]) -> Optional[str]:
+        return add_saved_job(self.state, title, jd_text, settings)
+
+    def delete_job(self, job_id: int) -> bool:
+        return delete_saved(self.state, "saved_jobs", job_id)
+
+    def list_reports(self, kind: Optional[str] = None) -> List[Dict[str, object]]:
+        items = [r for r in reversed(self.state.get("saved_reports", [])) if kind in (None, r["kind"])]
+        return [{k: v for k, v in r.items() if k != "html"} for r in items]
+
+    def get_report_html(self, report_id: int) -> Optional[str]:
+        return next((str(r["html"]) for r in self.state.get("saved_reports", []) if r["id"] == report_id), None)
+
+    def add_report(self, kind: str, title: str, html: str, summary: Dict[str, object]) -> Optional[str]:
+        return add_saved_report(self.state, kind, title, html, summary)
+
+    def delete_report(self, report_id: int) -> bool:
+        return delete_saved(self.state, "saved_reports", report_id)
+
+
+class DbWorkspace:
+    """Saved jobs and reports for a real account, stored in the database."""
+
+    persistent = True
+
+    def __init__(self, db, user_id: int, state):
+        self.db = db
+        self.user_id = int(user_id)
+        self.state = state
+        self.label = (
+            "your account, in the database" if db.kind == "postgres"
+            else "your account (a local file that may be wiped when the app restarts)"
+        )
+
+    def _cache(self, key: str, loader):
+        cache = self.state.setdefault("_ws_cache", {})
+        if key not in cache:
+            cache[key] = loader()
+        return cache[key]
+
+    def _invalidate(self) -> None:
+        self.state["_ws_cache"] = {}
+
+    def list_jobs(self) -> List[Dict[str, object]]:
+        return list(self._cache("jobs", lambda: auth.list_jobs(self.db, self.user_id)))
+
+    def get_job(self, job_id: int) -> Optional[Dict[str, object]]:
+        return auth.get_job(self.db, self.user_id, job_id)
+
+    def add_job(self, title: str, jd_text: str, settings: Dict[str, object]) -> Optional[str]:
+        _id, problem = auth.save_job(self.db, self.user_id, title, jd_text, settings)
+        self._invalidate()
+        return problem
+
+    def delete_job(self, job_id: int) -> bool:
+        ok = auth.delete_job(self.db, self.user_id, job_id)
+        self._invalidate()
+        return ok
+
+    def list_reports(self, kind: Optional[str] = None) -> List[Dict[str, object]]:
+        items = self._cache("reports", lambda: auth.list_reports(self.db, self.user_id, None, 200))
+        return [r for r in items if kind in (None, r["kind"])]
+
+    def get_report_html(self, report_id: int) -> Optional[str]:
+        return auth.get_report_html(self.db, self.user_id, report_id)
+
+    def add_report(self, kind: str, title: str, html: str, summary: Dict[str, object]) -> Optional[str]:
+        _id, problem = auth.save_report(self.db, self.user_id, title, kind, html, summary)
+        self._invalidate()
+        return problem
+
+    def delete_report(self, report_id: int) -> bool:
+        ok = auth.delete_report(self.db, self.user_id, report_id)
+        self._invalidate()
+        return ok
+
+
+# --------------------------------------------------------------------------------------
 # PROTOTYPE account flow
 #
 # Everything below is SIMULATED. No account is created, no password is kept, no email is
@@ -2396,6 +2837,7 @@ def make_demo_user(email: str, role: str) -> Dict[str, object]:
         "verified": True,
         "must_change": False,
         "created_at": now_utc_text(),
+        "mode": "prototype",
     }
 
 
@@ -2500,7 +2942,7 @@ def demo_user_action(state, email: str, action: str) -> str:
 def sign_out(state) -> None:
     """Forget the demo account and everything held in memory for this session."""
     for key in list(state.keys()):
-        if key not in ("dark_mode", "intro_done"):
+        if key not in ("dark_mode", "intro_done", "auth_mode"):
             del state[key]
 
 
@@ -2521,11 +2963,362 @@ def _show(st, text: str, tone: str = "bad", icon: str = "⛔") -> None:
     st.markdown(note_html(text, tone, icon), unsafe_allow_html=True)
 
 
-def render_auth(st, state) -> None:  # pragma: no cover - UI
-    view = state.get("auth_view", "login")
+def read_app_secrets(st) -> Tuple[Optional[Dict[str, str]], Optional[str], Optional[str]]:
+    """Optional settings from Streamlit secrets: an [smtp] table, ``admin_email`` and ``database_url``."""
+    smtp_conf: Optional[Dict[str, str]] = None
+    admin_email: Optional[str] = None
+    database_url: Optional[str] = None
+    try:
+        if "smtp" in st.secrets:
+            smtp_conf = {str(k): v for k, v in dict(st.secrets["smtp"]).items()}
+    except Exception:  # noqa: BLE001 - no secrets file is the normal case
+        smtp_conf = None
+    try:
+        value = st.secrets.get("admin_email")
+        admin_email = value.strip() if isinstance(value, str) and value.strip() else None
+    except Exception:  # noqa: BLE001
+        admin_email = None
+    try:
+        value = st.secrets.get("database_url")
+        database_url = value.strip() if isinstance(value, str) and value.strip() else None
+    except Exception:  # noqa: BLE001
+        database_url = None
+    return smtp_conf, admin_email, database_url
+
+
+REAL_MODE = "Real account"
+PROTOTYPE_MODE = "Prototype (simulated)"
+
+
+def _apply_revised_jd(state, text: str) -> None:
+    state["jd_text"] = text
+
+
+def _start_real_session(state, user: Dict[str, object]) -> None:
+    state["user"] = dict(user, mode="real")
+    state["auth_view"] = "login"
+
+
+def _send_code_email(smtp_conf, user: Dict[str, object], db, purpose: str) -> Optional[str]:
+    code = auth.issue_code(db, int(user["id"]), purpose)
+    subject = "Your FairHire verification code" if purpose == "verify" else "Your FairHire password reset code"
+    body = f"Your FairHire code is {code}. It expires in {auth.CODE_TTL_SECONDS // 60} minutes. If you did not ask for it, ignore this email."
+    ok, error = auth.send_email(smtp_conf, str(user["email"]), subject, body)
+    return None if ok else error
+
+
+def render_auth(st, state, db, db_error, smtp_conf, admin_email) -> None:  # pragma: no cover - UI
+    """Sign-in screen with a switch between real accounts and the simulated prototype."""
     _, middle, _ = st.columns([1, 1.5, 1])
     with middle:
         st.markdown('<div class="fh-card-marker"></div>' + auth_brand_html(), unsafe_allow_html=True)
+        if db is None:
+            state["auth_mode"] = PROTOTYPE_MODE
+        options = [REAL_MODE, PROTOTYPE_MODE] if db is not None else [PROTOTYPE_MODE]
+        if state.get("auth_mode") not in options:
+            state["auth_mode"] = options[0]
+        mode = st.radio("Sign-in mode", options, key="auth_mode", horizontal=True, on_change=_set_view, args=(state, "login"))
+        if db_error:
+            _show(st, db_error, "bad")
+        if mode == REAL_MODE:
+            st.caption("Real account: your email and a salted password hash are stored in this app's database.")
+            if db is not None and db.kind == "sqlite":
+                _show(
+                    st,
+                    "Accounts are stored in a local file that may be wiped when the app restarts. Add a database_url in Settings → Secrets "
+                    "for lasting storage (see the README).",
+                    "warn",
+                    "⚠️",
+                )
+        else:
+            st.caption("Prototype: nothing is stored. Any valid-looking email and password works.")
+    if mode == REAL_MODE and db is not None:
+        _auth_body_real(st, state, middle, db, smtp_conf, admin_email)
+    else:
+        _auth_body_prototype(st, state, middle)
+
+
+def _auth_body_real(st, state, middle, db, smtp_conf, admin_email) -> None:  # pragma: no cover - UI
+    smtp_ok = auth.smtp_configured(smtp_conf)
+    view = state.get("auth_view", "login")
+    with middle:
+        flash = state.pop("auth_flash", None)
+        if flash:
+            _show(st, flash, "info", "✅")
+
+        if view == "signup":
+            st.markdown(section_html("Create your account"), unsafe_allow_html=True)
+            if auth.count_users(db) == 0 and not admin_email:
+                st.caption("The first account created becomes the administrator.")
+            email = st.text_input("Work email", key="rsu_email", placeholder="Work email", label_visibility="collapsed")
+            password = st.text_input("Password", type="password", key="rsu_pw", placeholder="Password (10+ characters)", label_visibility="collapsed")
+            st.markdown(password_meter_html(password), unsafe_allow_html=True)
+            confirm = st.text_input("Confirm password", type="password", key="rsu_pw2", placeholder="Confirm password", label_visibility="collapsed")
+            if not smtp_ok:
+                st.caption("Email verification is off because no email service is configured.")
+            if st.button("Create account", type="primary", use_container_width=True, key="rsu_submit"):
+                if password != confirm:
+                    _show(st, "The two passwords do not match.")
+                else:
+                    user, error = auth.create_user(db, email, password, verified=not smtp_ok, admin_email=admin_email)
+                    if error:
+                        _show(st, error)
+                    elif smtp_ok:
+                        problem = _send_code_email(smtp_conf, user, db, "verify")
+                        state["pending_email"] = user["email"]
+                        state["auth_view"] = "verify"
+                        state["auth_flash"] = "We emailed you a 6-digit code." if not problem else f"{problem} Use 'Send a new code'."
+                        st.rerun()
+                    else:
+                        _start_real_session(state, user)
+                        st.rerun()
+            st.button("Already have an account? Sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "verify":
+            st.markdown(section_html("Verify your email"), unsafe_allow_html=True)
+            pending = state.get("pending_email", "")
+            st.caption(f"Enter the 6-digit code we sent to {pending}.")
+            with st.form("rverify_form"):
+                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
+                submitted = st.form_submit_button("Verify", type="primary", use_container_width=True)
+            if submitted:
+                user = auth.get_user_by_email(db, pending)
+                if user and auth.check_code(db, user["id"], "verify", code):
+                    auth.set_verified(db, user["id"])
+                    state["auth_flash"] = "Email verified. You can sign in now."
+                    state["auth_view"] = "login"
+                    st.rerun()
+                else:
+                    _show(st, "That code is not valid or has expired.")
+            if st.button("Send a new code", use_container_width=True):
+                user = auth.get_user_by_email(db, pending)
+                if user and not user["verified"]:
+                    problem = _send_code_email(smtp_conf, user, db, "verify")
+                    _show(st, problem or "A new code is on its way.", "bad" if problem else "info", "✉️")
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "forgot":
+            st.markdown(section_html("Reset your password"), unsafe_allow_html=True)
+            if not smtp_ok:
+                _show(
+                    st,
+                    "Password reset by email is not set up for this app. Ask an administrator to reset your password. "
+                    "They will give you a temporary one that you change at your next sign-in.",
+                    "info",
+                    "ℹ️",
+                )
+            else:
+                with st.form("rforgot_form"):
+                    email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                    submitted = st.form_submit_button("Email me a code", type="primary", use_container_width=True)
+                if submitted:
+                    user = auth.get_user_by_email(db, email)
+                    if user:
+                        _send_code_email(smtp_conf, user, db, "reset")
+                    state["pending_email"] = auth.normalize_email(email)
+                    state["auth_flash"] = "If that email has an account, a code has been sent."
+                    state["auth_view"] = "reset"
+                    st.rerun()
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        elif view == "reset":
+            st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
+            with st.form("rreset_form"):
+                email = st.text_input("Email address", value=state.get("pending_email", ""), placeholder="Email address", label_visibility="collapsed")
+                code = st.text_input("Code", placeholder="6-digit code", label_visibility="collapsed", max_chars=6)
+                password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
+                confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
+                submitted = st.form_submit_button("Update password", type="primary", use_container_width=True)
+            if submitted:
+                user = auth.get_user_by_email(db, email)
+                if password != confirm:
+                    _show(st, "The two passwords do not match.")
+                elif not (user and auth.check_code(db, user["id"], "reset", code)):
+                    _show(st, "That code is not valid or has expired.")
+                else:
+                    problem = auth.set_password(db, user["id"], password)
+                    if problem:
+                        _show(st, problem)
+                    else:
+                        state["auth_flash"] = "Password updated. You can sign in now."
+                        state["auth_view"] = "login"
+                        st.rerun()
+            st.button("Back to sign in", on_click=_set_view, args=(state, "login"), use_container_width=True)
+
+        else:
+            st.markdown(section_html("Welcome back"), unsafe_allow_html=True)
+            with st.form("rlogin_form"):
+                email = st.text_input("Email address", placeholder="Email address", label_visibility="collapsed")
+                password = st.text_input("Password", type="password", placeholder="Password", label_visibility="collapsed")
+                submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+            if submitted:
+                user, error = auth.authenticate(db, email, password)
+                if error:
+                    _show(st, error)
+                else:
+                    _start_real_session(state, user)
+                    st.rerun()
+            st.button("New to FairHire? Create an account", on_click=_set_view, args=(state, "signup"), use_container_width=True)
+            st.button("Forgot your password?", on_click=_set_view, args=(state, "forgot"), use_container_width=True)
+        st.caption("Resumes you upload are processed in memory and are never saved.")
+
+
+def render_must_change(st, state, db, user) -> None:  # pragma: no cover - UI
+    _, middle, _ = st.columns([1, 1.5, 1])
+    with middle:
+        st.markdown('<div class="fh-card-marker"></div>' + auth_brand_html(), unsafe_allow_html=True)
+        st.markdown(section_html("Choose a new password"), unsafe_allow_html=True)
+        st.caption("An administrator gave you a temporary password. Set your own to continue.")
+        with st.form("must_change_form"):
+            current = st.text_input("Temporary password", type="password", placeholder="Temporary password", label_visibility="collapsed")
+            password = st.text_input("New password", type="password", placeholder="New password (10+ characters)", label_visibility="collapsed")
+            confirm = st.text_input("Confirm new password", type="password", placeholder="Confirm new password", label_visibility="collapsed")
+            submitted = st.form_submit_button("Save password", type="primary", use_container_width=True)
+        if submitted:
+            if password != confirm:
+                _show(st, "The two passwords do not match.")
+            else:
+                problem = auth.change_password(db, user["id"], current, password)
+                if problem:
+                    _show(st, problem)
+                else:
+                    _start_real_session(state, auth.get_user(db, user["id"]))
+                    st.rerun()
+        st.button("Sign out", on_click=sign_out, args=(state,), use_container_width=True)
+
+
+def render_dashboard(st, state, user, ws) -> None:  # pragma: no cover - UI
+    """One dashboard for both modes; ``ws`` decides whether items live in the session or the database."""
+    jobs = ws.list_jobs()
+    reports = ws.list_reports("screening")
+    audits = ws.list_reports("audit")
+    st.markdown(section_html("Your dashboard"), unsafe_allow_html=True)
+    st.markdown(
+        kpis_html([kpi_card("Saved jobs", len(jobs)), kpi_card("Saved reports", len(reports)), kpi_card("Fairness audits", len(audits))]),
+        unsafe_allow_html=True,
+    )
+    if not ws.persistent:
+        _show(
+            st,
+            "Prototype: items marked (sample) are made up. Anything you save is kept only in this browser tab and disappears when you "
+            "close it or sign out. Resumes are never saved.",
+            "info",
+            "🧪",
+        )
+    elif ws.db.kind == "postgres":
+        _show(st, "Private to your account and kept in the database. Resumes are never saved; reports hold candidate numbers, scores and explanations.", "info", "🔒")
+    else:
+        _show(
+            st,
+            "Private to your account, but kept in a local file that may be wiped when the app restarts. Add a database_url in Settings → "
+            "Secrets for lasting storage. Resumes are never saved.",
+            "warn",
+            "⚠️",
+        )
+    note = state.pop("dash_flash", None)
+    if note:
+        _show(st, note, "info", "✅")
+
+    st.markdown(section_html("Saved jobs"), unsafe_allow_html=True)
+    if not jobs:
+        st.markdown(empty_state_html("No saved jobs", "Open the Screening tab and use Save this job.", "💼"), unsafe_allow_html=True)
+    for job in jobs:
+        c1, c2, c3 = st.columns([5, 1, 1])
+        c1.markdown(f'<b>{_esc(job["title"])}</b><div class="fh-muted">{_esc(job["created_at"])}</div>', unsafe_allow_html=True)
+        if c2.button("Load", key=f"load_job_{job['id']}"):
+            full = ws.get_job(job["id"])
+            if full:
+                apply_job_to_state(state, full)
+                state["dash_flash"] = f"Loaded '{full['title']}'. Open the Screening tab to continue."
+                st.rerun()
+        if c3.button("Delete", key=f"del_job_{job['id']}"):
+            ws.delete_job(job["id"])
+            st.rerun()
+
+    for heading, items in (("Saved reports", reports), ("Previous fairness audits", audits)):
+        st.markdown(section_html(heading), unsafe_allow_html=True)
+        if not items:
+            st.markdown(empty_state_html("Nothing saved yet", "Save one from the Review & report or Fairness audit tab.", "📁"), unsafe_allow_html=True)
+        for item in items:
+            c1, c3 = st.columns([6, 1])
+            c1.markdown(
+                f'<b>{_esc(item["title"])}</b><div class="fh-muted">{_esc(item["created_at"])} | '
+                f'{_esc(describe_summary(item["kind"], item["summary"]))}</div>',
+                unsafe_allow_html=True,
+            )
+            if c3.button("Delete", key=f"del_rep_{item['id']}"):
+                ws.delete_report(item["id"])
+                st.rerun()
+
+    everything = reports + audits
+    if everything:
+        st.markdown(section_html("Download a saved report"), unsafe_allow_html=True)
+        labels = [f"{r['title']} | {r['created_at']} | #{r['id']}" for r in everything]
+        choice = st.selectbox("Saved report", labels, label_visibility="collapsed")
+        picked = everything[labels.index(choice)]
+        html_text = ws.get_report_html(picked["id"]) or ""
+        st.download_button(
+            "⬇️ Download", data=html_text.encode("utf-8"), file_name=f"fairhire_{picked['kind']}_{picked['id']}.html", mime="text/html",
+        )
+
+
+def render_admin_real(st, state, db, user) -> None:  # pragma: no cover - UI
+    st.markdown(section_html("Administration"), unsafe_allow_html=True)
+    try:
+        users = auth.list_users(db, int(user["id"]))
+    except PermissionError:
+        _show(st, "Administrator access is required.")
+        return
+    _show(st, "You can manage accounts. You cannot see anyone's jobs, reports or resumes, only how many each person has.", "info", "🛡️")
+    note = state.pop("admin_flash", None)
+    if note:
+        _show(st, note, "info", "✅")
+    table = pd.DataFrame(
+        [
+            {"Email": u["email"] + (" (you)" if u["id"] == user["id"] else ""), "Role": u["role"], "Verified": "yes" if u["verified"] else "no",
+             "Jobs": u["jobs"], "Reports": u["reports"], "Created": u["created_at"]}
+            for u in users
+        ]
+    )
+    st.markdown(df_table_html(table, 200), unsafe_allow_html=True)
+    others = [u for u in users if u["id"] != user["id"]]
+    if not others:
+        st.caption("No other accounts yet.")
+        return
+    labels = [f"{u['email']} ({u['role']})" for u in others]
+    choice = st.selectbox("Account", labels, key="radmin_target")
+    action = st.selectbox("Action", ["Make administrator", "Make recruiter", "Reset password", "Delete account"], key="radmin_action")
+    confirm = st.checkbox("I understand this cannot be undone", key="radmin_confirm")
+    if st.button("Apply", type="primary", key="radmin_apply"):
+        target = others[labels.index(choice)]
+        if action in ("Reset password", "Delete account") and not confirm:
+            _show(st, "Tick the box to confirm.")
+        elif action in ("Make administrator", "Make recruiter"):
+            problem = auth.set_role(db, user["id"], target["id"], "admin" if action == "Make administrator" else "recruiter")
+            if problem:
+                _show(st, problem)
+            else:
+                state["admin_flash"] = f"{target['email']} is now {'an administrator' if action == 'Make administrator' else 'a recruiter'}."
+                st.rerun()
+        elif action == "Reset password":
+            temporary, problem = auth.admin_reset_password(db, user["id"], target["id"])
+            if problem:
+                _show(st, problem)
+            else:
+                _show(st, "Temporary password created. Share it with the user privately. They must change it when they sign in. It is shown only now.", "info", "🔑")
+                st.code(temporary)
+        else:
+            problem = auth.delete_user(db, user["id"], target["id"])
+            if problem:
+                _show(st, problem)
+            else:
+                state["admin_flash"] = f"{target['email']} was deleted."
+                st.rerun()
+
+
+def _auth_body_prototype(st, state, middle) -> None:  # pragma: no cover - UI
+    view = state.get("auth_view", "login")
+    with middle:
         flash = state.pop("auth_flash", None)
         if flash:
             _show(st, flash, "info", "✅")
@@ -2633,61 +3426,7 @@ def render_auth(st, state) -> None:  # pragma: no cover - UI
         st.caption(PROTOTYPE_FOOTNOTE)
 
 
-def render_dashboard(st, state, user) -> None:  # pragma: no cover - UI
-    jobs = list(reversed(state.get("saved_jobs", [])))
-    reports = [r for r in reversed(state.get("saved_reports", [])) if r["kind"] == "screening"]
-    audits = [r for r in reversed(state.get("saved_reports", [])) if r["kind"] == "audit"]
-    st.markdown(section_html("Your dashboard"), unsafe_allow_html=True)
-    st.markdown(
-        kpis_html([kpi_card("Saved jobs", len(jobs)), kpi_card("Saved reports", len(reports)), kpi_card("Fairness audits", len(audits))]),
-        unsafe_allow_html=True,
-    )
-    _show(
-        st,
-        "Prototype: items marked (sample) are made up. Anything you save is kept only in this browser tab and disappears when you "
-        "close it or sign out. Resumes are never saved.",
-        "info",
-        "🧪",
-    )
-    note = state.pop("dash_flash", None)
-    if note:
-        _show(st, note, "info", "✅")
-
-    st.markdown(section_html("Saved jobs"), unsafe_allow_html=True)
-    if not jobs:
-        st.markdown(empty_state_html("No saved jobs", "Open the Screening tab and use Save this job.", "💼"), unsafe_allow_html=True)
-    for job in jobs:
-        c1, c2, c3 = st.columns([5, 1, 1])
-        c1.markdown(f'<b>{_esc(job["title"])}</b><div class="fh-muted">{_esc(job["created_at"])}</div>', unsafe_allow_html=True)
-        if c2.button("Load", key=f"load_job_{job['id']}"):
-            apply_job_to_state(state, job)
-            state["dash_flash"] = f"Loaded '{job['title']}'. Open the Screening tab to continue."
-            st.rerun()
-        if c3.button("Delete", key=f"del_job_{job['id']}"):
-            delete_saved(state, "saved_jobs", job["id"])
-            st.rerun()
-
-    for heading, items in (("Saved reports", reports), ("Previous fairness audits", audits)):
-        st.markdown(section_html(heading), unsafe_allow_html=True)
-        if not items:
-            st.markdown(empty_state_html("Nothing saved yet", "Save one from the Review & report or Fairness audit tab.", "📁"), unsafe_allow_html=True)
-        for item in items:
-            c1, c2, c3 = st.columns([5, 1.4, 1])
-            c1.markdown(
-                f'<b>{_esc(item["title"])}</b><div class="fh-muted">{_esc(item["created_at"])} | '
-                f'{_esc(describe_summary(item["kind"], item["summary"]))}</div>',
-                unsafe_allow_html=True,
-            )
-            c2.download_button(
-                "Download", data=str(item["html"]).encode("utf-8"), file_name=f"fairhire_{item['kind']}_{item['id']}.html",
-                mime="text/html", key=f"dl_{item['id']}",
-            )
-            if c3.button("Delete", key=f"del_rep_{item['id']}"):
-                delete_saved(state, "saved_reports", item["id"])
-                st.rerun()
-
-
-def render_admin(st, state, user) -> None:  # pragma: no cover - UI
+def render_admin_prototype(st, state, user) -> None:  # pragma: no cover - UI
     st.markdown(section_html("Administration"), unsafe_allow_html=True)
     _show(
         st,
@@ -2735,12 +3474,26 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         "min_years": 0.0, "shortlist": 3, "w_skill": 60, "w_exp": 25, "w_kw": 15,
         "custom_skills_text": "", "extra_skills_text": "", "anonymize": True, "reveal_files": False,
         "stress_raw": False, "auth_view": "login", "job_title": "", "report_title": "", "audit_title": "",
-        "split_mode": "Detect automatically", "ingest_rows": [], "show_original": False,
+        "split_mode": "Detect automatically", "ingest_rows": [], "show_original": False, "auth_mode": REAL_MODE, "jd_check_text": "",
     }
     for key, value in defaults.items():
         state.setdefault(key, value)
 
-    user = state.get("user")  # a simulated account that lives only in this browser session
+    smtp_conf, admin_email, database_url = read_app_secrets(st)
+    db, db_error = None, None
+    try:
+        db = auth.get_database(database_url)
+    except Exception as exc:  # noqa: BLE001 - never show the connection string
+        db_error = f"Could not open the database ({type(exc).__name__}). Real accounts are unavailable; the prototype still works."
+    user = state.get("user")
+    if user and user.get("mode") == "real":  # re-read every run so role changes and deleted accounts take effect at once
+        fresh = auth.get_user(db, user["id"]) if db is not None else None
+        if fresh is None:
+            sign_out(state)
+            user = None
+        else:
+            user = dict(fresh, mode="real")
+            state["user"] = user
 
     top_left, top_right = st.columns([6, 1.3])
     with top_right:
@@ -2749,7 +3502,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
     with top_right:
         st.markdown(theme_label_html(dark), unsafe_allow_html=True)
         if user:
-            st.markdown(f'<div class="fh-theme-label">{_esc(user["email"])} | {_esc(user["role"])}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="fh-theme-label">{_esc(user["email"])} | {_esc(user["role"])} | {"prototype" if user.get("mode") == "prototype" else "account"}</div>', unsafe_allow_html=True)
             st.button("Sign out", on_click=sign_out, args=(state,), use_container_width=True)
     st.markdown(theme_css(dark) + theme_marker_html(dark), unsafe_allow_html=True)
     try:  # second, independent way to apply the theme (see theme_script_html)
@@ -2767,23 +3520,39 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         state["intro_done"] = True
 
     if not user:
-        render_auth(st, state)
+        render_auth(st, state, db, db_error, smtp_conf, admin_email)
         return
+    if user["must_change"]:
+        render_must_change(st, state, db, user)
+        return
+    ws = SessionWorkspace(state) if user.get("mode") == "prototype" else DbWorkspace(db, user["id"], state)
     flash = state.pop("flash", None)
     if flash:
         st.markdown(note_html(flash[1], flash[0], "✅" if flash[0] == "info" else "⛔"), unsafe_allow_html=True)
-    st.markdown(note_html(PROTOTYPE_BANNER, "info", "🧪"), unsafe_allow_html=True)
+    if user.get("mode") == "prototype":
+        st.markdown(note_html(PROTOTYPE_BANNER, "info", "🧪"), unsafe_allow_html=True)
+    else:
+        st.markdown(
+            note_html(
+                f"Signed in. Saved items are kept in {ws.label}. Resumes are read in memory and never saved.",
+                "info" if db.kind == "postgres" else "warn", "🔒" if db.kind == "postgres" else "⚠️",
+            ),
+            unsafe_allow_html=True,
+        )
 
     is_admin = user["role"] == "admin"
-    tab_names = ["🏠 Dashboard", "📄 Screening", "📝 Review & report", "🧪 Bias stress test", "📊 Fairness audit", "📘 Methodology"]
+    tab_names = [
+        "🏠 Dashboard", "📄 Screening", "🔎 Job description check", "📝 Review & report", "🧪 Bias stress test",
+        "📊 Fairness audit", "📘 Methodology",
+    ]
     if is_admin:
         tab_names.append("🛡️ Admin")
     tabs = st.tabs(tab_names)
-    tab_dash, tab_screen, tab_review, tab_stress, tab_audit, tab_method = tabs[:6]
-    tab_admin = tabs[6] if is_admin else None
+    tab_dash, tab_screen, tab_jd, tab_review, tab_stress, tab_audit, tab_method = tabs[:7]
+    tab_admin = tabs[7] if is_admin else None
 
     with tab_dash:
-        render_dashboard(st, state, user)
+        render_dashboard(st, state, user, ws)
 
     results: List[Dict[str, object]] = []
     config: Dict[str, object] = {}
@@ -2808,6 +3577,9 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             st.button("✨ One-click demo", on_click=load_demo, use_container_width=True)
             st.checkbox("Include the sample resumes (demo)", key="use_sample")
             st.text_area("Job description", key="jd_text", height=150, placeholder="Paste the job description here...")
+            jd_flag_count = len(check_job_description(state["jd_text"])["findings"])
+            if jd_flag_count:
+                st.caption(f"🔎 {jd_flag_count} wording flag(s) in this job description. See the Job description check tab.")
             with st.expander("➕ Add your own skills"):
                 st.caption("One per line: skill = alias 1, alias 2")
                 st.text_area(
@@ -2837,8 +3609,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             with st.expander("💾 Save this job to my dashboard"):
                 st.text_input("Job title", key="job_title", placeholder="e.g. Data Scientist, Q4")
                 if st.button("Save job", key="save_job_btn"):
-                    problem = add_saved_job(state, state["job_title"], state["jd_text"], job_settings_from_state(state))
-                    state["flash"] = ("bad", problem) if problem else ("info", "Job saved to your dashboard (this browser tab only).")
+                    problem = ws.add_job(state["job_title"], state["jd_text"], job_settings_from_state(state))
+                    state["flash"] = ("bad", problem) if problem else ("info", f"Job saved to {ws.label}.")
                     st.rerun()
             st.checkbox("Anonymize resumes before scoring", key="anonymize")
             st.checkbox("Show file names in results", key="reveal_files")
@@ -2882,6 +3654,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
         config = {
             "required": required, "min_years": min_years, "weights": weights, "anonymize": anonymize,
             "shortlist": shortlist, "jd_given": bool(jd_text.strip()), "custom_skills": len(custom_bank),
+            "jd_flags": jd_flag_count,
         }
 
         with right:
@@ -2939,7 +3712,7 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                 st.markdown(section_html("Why each candidate scored as they did"), unsafe_allow_html=True)
                 st.markdown(
                     "".join(
-                        candidate_card_html(item, reveal_files, open_card=(index == 0), show_original=bool(state["show_original"]))
+                        candidate_card_html(item, reveal_files, open_card=(index == 0), show_original=bool(state["show_original"]), skill_bank=bank)
                         for index, item in enumerate(results[:MAX_DETAIL_CARDS])
                     ),
                     unsafe_allow_html=True,
@@ -2949,7 +3722,55 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                     _show(st, f"Showing details for the top {MAX_DETAIL_CARDS} of {len(results)} candidates. Pick any other candidate below.", "info", "ℹ️")
                     rest_labels = [f"{r['candidate_id']} ({float(r['score']):.1f})" for r in rest]
                     pick = st.selectbox("Open details for another candidate", rest_labels)
-                    st.markdown(candidate_card_html(rest[rest_labels.index(pick)], reveal_files, open_card=True, show_original=bool(state["show_original"])), unsafe_allow_html=True)
+                    st.markdown(candidate_card_html(rest[rest_labels.index(pick)], reveal_files, open_card=True, show_original=bool(state["show_original"]), skill_bank=bank), unsafe_allow_html=True)
+
+    # ------------------------------------------------------------------ Job description check tab
+    with tab_jd:
+        st.markdown(section_html("Job description check"), unsafe_allow_html=True)
+        _show(
+            st,
+            "Checks the wording of a job post for terms that can discourage or exclude groups of applicants (gender-coded words, age, "
+            "nationality, family status, appearance and more). It is rule-based and not exhaustive: a flag is a prompt to reconsider the "
+            "wording, not proof of discrimination.",
+            "info",
+            "🔎",
+        )
+        st.text_area(
+            "Or paste a different job description to check", key="jd_check_text", height=110,
+            placeholder="Leave empty to check the job description from the Screening tab",
+        )
+        checking_own = not state["jd_check_text"].strip()
+        jd_source = state["jd_text"] if checking_own else state["jd_check_text"]
+        if not jd_source.strip():
+            st.markdown(
+                empty_state_html("Nothing to check yet", "Paste a job description on the Screening tab or in the box above.", "🔎"),
+                unsafe_allow_html=True,
+            )
+        else:
+            jd_result = check_job_description(jd_source)
+            st.markdown(jd_summary_html(jd_result), unsafe_allow_html=True)
+            left_col, right_col = st.columns([2, 1], gap="large")
+            with left_col:
+                st.markdown(section_html("Flagged wording"), unsafe_allow_html=True)
+                st.markdown(jd_findings_html(jd_result), unsafe_allow_html=True)
+            with right_col:
+                st.markdown(section_html("Gender-coded wording"), unsafe_allow_html=True)
+                st.markdown(gender_bar_html(jd_result["gender"]), unsafe_allow_html=True)
+            revised, changes = rewrite_job_description(jd_source, jd_result["findings"])
+            if changes:
+                st.markdown(section_html("Suggested revision"), unsafe_allow_html=True)
+                st.caption(
+                    f"{changes} safe replacement(s) applied. Flags without an automatic replacement need your judgement, "
+                    "so check the wording reads well."
+                )
+                st.text_area("Revised job description", value=revised, height=180)
+                if checking_own:
+                    st.button(
+                        "Use this revised text as my job description", on_click=_apply_revised_jd, args=(state, revised),
+                        type="primary",
+                    )
+                else:
+                    st.caption("Copy the revised text from the box above.")
 
     # ------------------------------------------------------------------ Fairness audit tab
     # (built before the review tab so the report can include the latest simulation)
@@ -3020,10 +3841,10 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
             st.markdown(section_html("Save this audit"), unsafe_allow_html=True)
             st.text_input("Audit title", key="audit_title", placeholder="e.g. Q4 audit, 15-point simulated bias")
             if st.button("💾 Save audit to my dashboard", key="save_audit_btn"):
-                problem = add_saved_report(
-                    state, "audit", state["audit_title"], build_audit_report_html(audit_sections), audit_summary(audit_sections)
+                problem = ws.add_report(
+                    "audit", state["audit_title"], build_audit_report_html(audit_sections), audit_summary(audit_sections)
                 )
-                state["flash"] = ("bad", problem) if problem else ("info", "Audit saved to your dashboard (this browser tab only).")
+                state["flash"] = ("bad", problem) if problem else ("info", f"Audit saved to {ws.label}.")
                 st.rerun()
 
     # ------------------------------------------------------------------ Review & report tab
@@ -3124,8 +3945,8 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
                     "top_score": round(float(results[0]["score"]), 1),
                     "decisions": len(state["review_log"]),
                 }
-                problem = add_saved_report(state, "screening", state["report_title"], saved_html, summary)
-                state["flash"] = ("bad", problem) if problem else ("info", "Report saved to your dashboard (this browser tab only).")
+                problem = ws.add_report("screening", state["report_title"], saved_html, summary)
+                state["flash"] = ("bad", problem) if problem else ("info", f"Report saved to {ws.label}.")
                 st.rerun()
 
     # ------------------------------------------------------------------ Bias stress test tab
@@ -3181,7 +4002,10 @@ def main() -> None:  # pragma: no cover - exercised only inside Streamlit
 
     if tab_admin is not None:
         with tab_admin:
-            render_admin(st, state, user)
+            if user.get("mode") == "prototype":
+                render_admin_prototype(st, state, user)
+            else:
+                render_admin_real(st, state, db, user)
 
     st.markdown(
         '<div class="fh-footer">FairHire is decision support, not a decision maker. A human reviews every outcome.</div>',
